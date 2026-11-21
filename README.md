@@ -29,6 +29,23 @@ below a change are marked out of date (their old content stays visible) until yo
 | what would model X do from *this* point? | pick kernel X, select the cell, Shift+Enter (the rest of the turn) — or ⏩ to keep going with X through every turn below |
 | how faithful is the reconstruction? | Run ▸ Replay the recorded calls: each output gets ✓ (same) or ≠ (different) in its prompt column |
 
+## The hosted page
+
+[saeejithnair.github.io/tracenb](https://saeejithnair.github.io/tracenb/) is the same UI without a server: three demo
+notebooks (recorded sessions with some versions already run), and any session file you drop on it, read in the page
+by tracenb itself running in Pyodide (the file is never uploaded). Running needs the files the session ran in, so it
+happens on your machine: install tracenb, start it, and open the second link it prints to connect the page to it.
+
+```
+uv tool install git+https://github.com/saeejithnair/tracenb    # macOS; uses your claude / codex CLI and their logins
+tracenb --no-browser                                          # prints …/tracenb/#connect=<port>:<token>
+```
+
+The page then lists your own sessions and runs cells through your local tracenb. Only this page's own origin and the
+hosted page holding the token (kept in `~/.cache/tracenb/token`) may use the server; `--allow-origin URL` adds another
+origin, e.g. your own copy. Build the page with `uv run python scripts/build_site.py site/demos.json OUT`; it stops if
+your username appears in a demo. `tracenb export <ref> -o x.json` writes any notebook as such a document.
+
 Keyboard (as in Jupyter): `↑`/`↓` or `j`/`k`, `Enter` edit, `Esc` leave edit mode, `Shift+Enter` run, `[`/`]` versions,
 `C` compare, `I,I` interrupt.
 

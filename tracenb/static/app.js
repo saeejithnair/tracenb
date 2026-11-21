@@ -35,19 +35,69 @@ const ui = {
 };
 document.documentElement.dataset.theme = store.get("tnb.theme", "light");
 
-// ------------------------------------------------------------------ utils
+// ------------------------------------------------------------------ where a notebook lives
+/* In one of two places:
+   - a runtime: a tracenb server. Either the one that served this page, or (on the hosted page) the one running on
+     your machine that you connected. It can run cells.
+   - a document: a snapshot of a notebook, opened right here (a demo, or a trace file you dropped on the page). You can
+     read it, edit cells, flip through its versions and compare them; running needs a runtime. */
+const SITE = window.TRACENB_SITE || null;  // set on the hosted page: { demos, wheel, install }
+let conn = SITE ? savedConn() : { base: "", token: "" };  // the runtime, if any
+let DOC = null;  // the open notebook, when it's a document
+function savedConn() {
+  try { const c = JSON.parse(store.get("tnb.conn", "null")); return c && { base: `http://127.0.0.1:${c.port}`, port: c.port, token: c.token }; }
+  catch { return null; }
+}
+class NeedsRuntime extends Error {}
+async function http(method, p, b) {
+  if (!conn) throw new NeedsRuntime("needs a runtime");
+  let r;
+  try {
+    r = await fetch(conn.base + p, { method, body: b ? JSON.stringify(b) : undefined,
+      headers: { ...(b ? { "Content-Type": "application/json" } : {}), ...(conn.token ? { "X-Tracenb-Token": conn.token } : {}) } });
+  } catch { throw new Error(SITE ? "Can't reach tracenb on this machine. Is it running? (tracenb --no-browser)" : "Can't reach the tracenb server"); }
+  const j = await r.json().catch(() => ({}));
+  if (r.status === 403 && SITE) throw new Error("tracenb refused this page. Reconnect with the link it prints when it starts.");
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
 const api = {
-  async get(p) { const r = await fetch(p); const j = await r.json(); if (!r.ok) throw new Error(j.error || r.statusText); return j; },
-  async post(p, b) {
-    const r = await fetch(p, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(b || {}) });
-    const j = await r.json(); if (!r.ok) throw new Error(j.error || r.statusText); return j;
-  },
+  get: async (p) => DOC && p.startsWith("/api/nb/") ? docGet(p) : http("GET", p),
+  post: async (p, b) => DOC && p.startsWith("/api/nb/") ? docPost(p, b) : http("POST", p, b || {}),
 };
+const events = (p) => new EventSource(conn.base + p + (conn.token ? `?token=${encodeURIComponent(conn.token)}` : ""));
+
+function docGet(p) {
+  const u = new URL(p, location.href), what = u.pathname.split("/")[4];
+  if (!what) return DOC;
+  const v = DOC.views?.[u.searchParams.get("take")] || {};
+  const text = what === "output" ? v.outputs?.[u.searchParams.get("i")] : v[what];
+  if (text == null) throw new Error("That isn't included in this notebook: it needs the project's files, which only a runtime has.");
+  return { text };
+}
+function docPost(p, b) {
+  if (p.split("/")[4] !== "select") throw new NeedsRuntime("needs a runtime");
+  for (let k = b.take; k; k = DOC.takes[k].parent) DOC.selected[DOC.takes[k].turn] = k;  // and its ancestors, as the kernel does
+  DOC.timeline = timelineOf(DOC);
+  setTimeout(renderAll);
+  return { ok: true };
+}
+/* The kernel's rule: each turn shows its selected version if that version continues the turn above. */
+function timelineOf(d) {
+  const out = {}; let prev = null;
+  for (const { turn: t } of d.turns) {
+    const sel = d.selected[t], ok = sel && d.takes[sel]?.turn === t && d.takes[sel].parent === prev;
+    out[t] = ok ? sel : null; prev = ok ? sel : "∅";
+  }
+  return out;
+}
+
+// ------------------------------------------------------------------ utils
 function toast(msg, bad) {
   const t = document.getElementById("toast"); t.textContent = msg; t.className = "on" + (bad ? " bad" : "");
   clearTimeout(toast.h); toast.h = setTimeout(() => (t.className = ""), bad ? 5000 : 2600);
 }
-async function act(fn) { try { return await fn(); } catch (e) { toast(e.message, true); } }
+async function act(fn) { try { return await fn(); } catch (e) { if (e instanceof NeedsRuntime) needRuntime(); else toast(e.message, true); } }
 function modal(title, body, html) {
   $("#modal-title").textContent = title;
   const b = $("#modal-body");
@@ -94,6 +144,7 @@ function rtLabel(spec) {
 const kernelLabel = () => rtLabel(ui.kernel);
 /* What the toolbar shows: the model and the effort it will actually think at (yours, or the default). */
 function kernelTitle() {
+  if (DOC) return conn ? "No kernel · read-only" : "No kernel · connect…";
   const m = modelOf(ui.kernel); const e = specEffort(ui.kernel) || m?.default_effort;
   return (m ? m.label : kernelLabel()) + (e ? ` · ${e}${specEffort(ui.kernel) ? "" : " (default)"}` : "");
 }
@@ -152,8 +203,13 @@ const editText = (st) => isShell(st) ? shellCmd(st.input) : JSON.stringify(st.in
 window.addEventListener("hashchange", route);
 function route() {
   if (es) { es.close(); es = null; }
-  const m = location.hash.match(/^#\/nb\/(.+)$/);
-  if (m) openNotebook(decodeURIComponent(m[1])); else library();
+  DOC = null;
+  const h = location.hash, c = h.match(/^#connect=(\d+):(.+)$/), m = h.match(/^#\/nb\/(.+)$/), d = h.match(/^#\/demo\/([\w-]+)$/);
+  if (c) connect(+c[1], decodeURIComponent(c[2]));
+  else if (m) openNotebook(decodeURIComponent(m[1]));
+  else if (d) openDemo(d[1]);
+  else if (h === "#/file" && uploaded) openDoc(uploaded);
+  else library();
 }
 
 function header(title, sub, right = "") {
@@ -168,12 +224,19 @@ function header(title, sub, right = "") {
 async function library() {
   S = null;
   document.title = "Home · tracenb";
+  const sessions = !SITE || conn;
   app.innerHTML = header("", "") + `
   <div class="scroll"><div class="browser">
+    ${SITE ? siteHomeHTML() : ""}
+    ${SITE ? `<div class="sec-h">Your sessions${conn ? ` <span class="hint">· from tracenb on this machine, port ${conn.port} · <a data-act="connect">connection</a></span>` : ""}</div>` : ""}
+    ${!sessions ? `<div class="connect-row"><p>To see your own Claude Code and Codex sessions here, and to run cells, connect tracenb running on your machine.</p>
+      <button class="jp-btn primary" data-act="connect">Connect a local runtime…</button></div>` : `
     <div class="browser-bar"><input id="q" placeholder="Filter sessions by title, project or first message — or paste a path to a .jsonl and press Enter" autofocus></div>
     <div class="browser-hd"><span class="c-name">Name</span><span class="c-proj">Project</span><span class="c-turns">Turns</span><span class="c-mod">Last Modified</span></div>
-    <div id="list"><div class="empty">Loading sessions…</div></div>
+    <div id="list"><div class="empty">Loading sessions…</div></div>`}
   </div></div>`;
+  if (SITE) wireDrop();
+  if (!sessions) return;
   const q = $("#q");
   let traces = [];
   const draw = () => {
@@ -206,10 +269,8 @@ async function openNotebook(id) {
   if (!S) return;
   { const m = modelOf(ui.kernel) || S.runtimes.find((r) => r.model_id === "claude-sonnet-5-5") || S.runtimes[0];
     ui.kernel = m.id + (specEffort(ui.kernel) && m.efforts.includes(specEffort(ui.kernel)) ? "@" + specEffort(ui.kernel) : ""); }
-  ui.sigs = {}; ui.sel = { t: S.turns[0]?.turn || 1, i: 0 }; ui.editing = null;
-  layout();
-  renderAll();
-  es = new EventSource(`/api/nb/${encodeURIComponent(id)}/events`);
+  begin();
+  es = events(`/api/nb/${encodeURIComponent(id)}/events`);
   es.onmessage = (m) => {
     const ev = JSON.parse(m.data);
     if (ev.type === "state") { S = ev.state; renderAll(); }
@@ -219,6 +280,99 @@ async function openNotebook(id) {
       if (where) { where[ev.take.id] = ev.take; renderAll(); }
     }
   };
+}
+
+function begin() {
+  ui.sigs = {}; ui.sel = { t: S.turns[0]?.turn || 1, i: 0 }; ui.editing = null; ui.compare.clear();
+  layout();
+  renderAll();
+}
+function openDoc(doc) { DOC = S = doc; begin(); }
+async function openDemo(id) {
+  app.innerHTML = header("Opening…", "") + `<div class="empty">Opening the demo…</div>`;
+  const doc = await act(async () => { const r = await fetch(`demos/${id}.json`); if (!r.ok) throw new Error("No such demo"); return r.json(); });
+  if (doc) openDoc({ ...doc, demo: id });
+}
+
+// ------------------------------------------------------------------ the hosted page: demos, trace files, connecting
+function siteHomeHTML() {
+  return `<div class="site-intro">
+    <p><b>tracenb</b> opens a Claude Code or Codex session as a notebook. Each tool call is a code cell with its output;
+    each of your messages starts a turn. Edit any cell (your message, a command, what the command returned), run from
+    there, and a model of your choice writes the rest. Every run becomes a new version of the turn, so you can compare.</p></div>
+    <div class="sec-h">Demos <span class="hint">· recorded sessions with some versions already run: flip through them with ‹ ›, or Compare</span></div>
+    ${SITE.demos.map((d) => `<a class="file-row" href="#/demo/${esc(d.id)}" title="${esc(d.blurb)}">
+      <span class="c-name">${ICON.nb(d.harness === "codex" ? "var(--c-codex)" : "#f37726")}${esc(d.title)}</span>
+      <span class="c-proj">${esc(d.blurb)}</span><span class="c-turns">${d.turns}</span><span class="c-mod">${d.versions} versions</span></a>`).join("")}
+    <div class="sec-h">Open a trace file</div>
+    <label class="drop" id="drop"><input type="file" id="file" accept=".jsonl,application/x-ndjson,application/json" hidden>
+      <b>Drop a session file here</b>, or click to choose one.
+      <span class="hint">Claude Code keeps them in ~/.claude/projects/&lt;project&gt;/*.jsonl, Codex in ~/.codex/sessions/. The file is read in this page and never uploaded.</span></label>`;
+}
+function wireDrop() {
+  const drop = $("#drop"); if (!drop) return;
+  $("#file").onchange = (e) => e.target.files[0] && openFile(e.target.files[0]);
+  drop.ondragover = (e) => { e.preventDefault(); drop.classList.add("over"); };
+  drop.ondragleave = () => drop.classList.remove("over");
+  drop.ondrop = (e) => { e.preventDefault(); drop.classList.remove("over"); e.dataTransfer.files[0] && openFile(e.dataTransfer.files[0]); };
+}
+
+/* A trace file is opened by tracenb itself, running in the page (Pyodide): the same importer as the local tool. */
+let uploaded = null, py = null;
+async function openFile(file) {
+  const drop = $("#drop");
+  drop && drop.classList.add("busy");
+  drop && (drop.querySelector("b").textContent = py ? `Reading ${file.name}…` : `Loading tracenb into the page (once, a few seconds), then reading ${file.name}…`);
+  const doc = await act(async () => {
+    py = py || await loadPy();
+    const path = "/w/" + file.name.replace(/[^\w.-]/g, "_");
+    py.FS.writeFile(path, await file.text());
+    try { return JSON.parse(py.runPython(`import json; from tracenb import kernel; json.dumps(kernel.open_notebook(${JSON.stringify(path)}).snapshot())`)); }
+    catch (e) { throw new Error(`tracenb couldn't read ${file.name} as a Claude Code or Codex session: ${String(e.message).trim().split("\n").pop()}`); }
+  });
+  if (!doc) { library(); return; }
+  if (conn) {  // if it's one of your own sessions, open it on your runtime, where it can run
+    try { const r = await http("POST", "/api/open", { ref: doc.id }); location.hash = `#/nb/${encodeURIComponent(r.id)}`; return; } catch { /* not on this machine */ }
+  }
+  uploaded = doc;
+  if (location.hash === "#/file") route(); else location.hash = "#/file";
+}
+async function loadPy() {
+  await new Promise((ok, bad) => { const sc = document.createElement("script"); sc.src = SITE.pyodide; sc.onload = ok; sc.onerror = () => bad(new Error("Couldn't load Pyodide")); document.head.append(sc); });
+  const p = await loadPyodide();
+  p.FS.mkdirTree("/w");
+  p.FS.writeFile("/w/tracenb.whl", new Uint8Array(await (await fetch(SITE.wheel)).arrayBuffer()));
+  p.runPython("import sys, zipfile; zipfile.ZipFile('/w/tracenb.whl').extractall('/w/pkg'); sys.path.insert(0, '/w/pkg')");
+  return p;
+}
+
+/* Running happens where the files are: on your machine. */
+function needRuntime() {
+  if (DOC && conn) return modal("This notebook can't run", `<p>${DOC.demo ? "This is a demo. The project it ran in isn't on your machine" : "This trace isn't one of the sessions on your machine"}, so there's nothing for a model to run against: running a cell rebuilds the project's files as they were at that point.</p>
+    <p>Your local runtime is connected. Open one of <a href="#/">your own sessions</a> to run cells.</p>`, true);
+  connectDialog();
+}
+function connectDialog() {
+  modal(conn ? "Local runtime" : "Connect a local runtime", `
+    <p>Running a cell executes commands and calls a model, so it happens on your machine, not in this page. tracenb runs there,
+    and this page talks to it on 127.0.0.1. Your sessions, your files and your Claude / Codex logins stay on your computer.</p>
+    ${conn ? `<p>Connected to tracenb on port ${conn.port}. <a data-act="disconnect">Disconnect</a></p>` : ""}
+    <ol class="steps">
+      <li>Install it. It needs macOS, Python 3.11+ and the <code>claude</code> and/or <code>codex</code> CLI, signed in:<pre class="cmd">${esc(SITE.install)}</pre></li>
+      <li>Start it:<pre class="cmd">tracenb --no-browser</pre></li>
+      <li>Open the second link it prints (<code>…/tracenb/#connect=…</code>), or paste it here:
+        <div class="conn-in"><input class="jp-input" id="conn-in" placeholder="${esc(location.origin + location.pathname)}#connect=7878:…" spellcheck="false">
+        <button class="jp-btn primary" data-act="do-connect">Connect</button></div></li>
+    </ol>`, true);
+}
+async function connect(port, token) {
+  const prev = conn;
+  conn = { base: `http://127.0.0.1:${port}`, port, token };
+  const ok = await act(() => http("GET", "/api/hello"));
+  if (ok) { store.set("tnb.conn", JSON.stringify({ port, token })); toast(`Connected to tracenb on this machine (port ${port})`); }
+  else conn = prev;
+  history.replaceState(null, "", location.pathname + "#/");  // the token doesn't stay in the address bar
+  route();
 }
 
 const MENUS = {
@@ -280,7 +434,7 @@ function layout() {
     <button class="tb text" data-act="compare" title="Show this turn's versions side by side (C)">Compare versions</button>
     <span class="sp"></span>
     <span class="spent" id="spent"></span>
-    <button class="kernel" data-act="kernel-dialog" title="Change kernel"><span id="kname"></span></button><span class="kstat" id="kstat"></span>
+    <button class="kernel" data-act="kernel-dialog" title="${DOC ? "Running needs a runtime" : "Change kernel"}"><span id="kname"></span></button><span class="kstat" id="kstat"></span>
   </div></div>
   <div id="menu-pop" hidden></div>
   <div class="scroll"><main class="notebook" id="nb"></main></div>
@@ -369,19 +523,20 @@ function chrome() {
   const ks = $("#kstat"); ks.innerHTML = ICON.status(busy); ks.title = busy ? "Kernel status: Busy" : "Kernel status: Idle";
   $("#mode").textContent = ui.editing ? "Mode: Edit" : "Mode: Command";
   $("#hint").innerHTML = hintText();
-  $("#sb-right").textContent = `${S.turns.length} turns · kernel: ${kernelLabel()}`;
+  $("#sb-right").textContent = `${S.turns.length} turns · ` + (DOC ? "read-only" : `kernel: ${kernelLabel()}`);
 }
 
 function hintText() {
   const { t, i } = ui.sel;
+  const k = DOC ? "a kernel (connect a runtime first)" : esc(kernelLabel());
   const tk = current(t);
-  if (ui.editing) return `Editing. <kbd>Shift+Enter</kbd> makes a new version from here with ${esc(kernelLabel())} · <kbd>Esc</kbd> stop editing (the change is kept until you run or revert it)`;
-  if (!tk) return `This turn is out of date: the conversation above it changed. <kbd>Shift+Enter</kbd> answers it again with ${esc(kernelLabel())}.`;
-  if (i === 0) return `Your message. Click to rewrite it · <kbd>Shift+Enter</kbd> runs the turn again with ${esc(kernelLabel())} as a new version · <kbd>[</kbd> <kbd>]</kbd> flip through versions`;
+  if (ui.editing) return `Editing. <kbd>Shift+Enter</kbd> makes a new version from here with ${k} · <kbd>Esc</kbd> stop editing (the change is kept until you run or revert it)`;
+  if (!tk) return `This turn is out of date: the conversation above it changed. <kbd>Shift+Enter</kbd> answers it again with ${k}.`;
+  if (i === 0) return `Your message. Click to rewrite it · <kbd>Shift+Enter</kbd> runs the turn again with ${k} as a new version · <kbd>[</kbd> <kbd>]</kbd> flip through versions`;
   const st = tk.steps.find((s) => s.i === i);
   if (!st) return "";
-  if (st.kind === "tool") return `A tool call. Click the command to change it (it really runs), or double-click the output to change what it returned · <kbd>Shift+Enter</kbd> new version where ${esc(kernelLabel())} continues after this cell`;
-  return `The agent's words. Double-click to rewrite them · <kbd>Shift+Enter</kbd> new version where ${esc(kernelLabel())} continues after this cell`;
+  if (st.kind === "tool") return `A tool call. Click the command to change it (it really runs), or double-click the output to change what it returned · <kbd>Shift+Enter</kbd> new version where ${k} continues after this cell`;
+  return `The agent's words. Double-click to rewrite them · <kbd>Shift+Enter</kbd> new version where ${k} continues after this cell`;
 }
 
 /* One Jupyter cell: an input row and (for calls) an output row, each with its collapser bar and prompt. */
@@ -737,10 +892,12 @@ function openMenu(name, anchor) {
 }
 function closeMenu() { ui.menu = null; $("#menu-pop") && ($("#menu-pop").hidden = true); document.querySelectorAll(".menu.open").forEach((m) => m.classList.remove("open")); }
 
+const NEEDS_RUNTIME = new Set(["run-stay", "run", "run-every", "run-below", "stop", "del-version", "del-check", "replay", "kernel-dialog"]);
 async function command(a, d, e) {
   const { t, i } = ui.sel;
   const tk = current(t);
 
+  if (DOC && NEEDS_RUNTIME.has(a)) return needRuntime();
   if (a.startsWith("theme:")) { document.documentElement.dataset.theme = a.slice(6); store.set("tnb.theme", a.slice(6)); return; }
   switch (a) {
     case "run-stay": await runFrom(t, i); break;
@@ -796,6 +953,7 @@ async function command(a, d, e) {
       if (r) modal(titles[a], r.text); break;
     }
     case "kernel-dialog": kernelDialog(); break;
+    case "connect": connectDialog(); break;
     case "help": modal("How tracenb works", HELP, true); break;
     case "keys": modal("Keyboard shortcuts", KEYS, true); break;
   }
@@ -841,6 +999,13 @@ document.addEventListener("click", async (e) => {
   const a = e.target.closest("[data-act]");
   if (!e.target.closest(".menu, #menu-pop")) closeMenu();
   if (a && a.dataset.act === "close-modal") { $("#modal").hidden = true; return; }
+  if (a && a.dataset.act === "connect" && !S) { connectDialog(); return; }
+  if (a && a.dataset.act === "disconnect") { conn = null; store.set("tnb.conn", "null"); $("#modal").hidden = true; toast("Disconnected"); route(); return; }
+  if (a && a.dataset.act === "do-connect") {
+    const v = $("#conn-in").value.trim(), m = v.match(/connect=(\d+):([^\s&]+)/) || v.match(/^(\d+):(\S+)$/);
+    if (!m) { toast("Paste the link tracenb printed: it ends in #connect=<port>:<token>", true); return; }
+    $("#modal").hidden = true; connect(+m[1], decodeURIComponent(m[2])); return;
+  }
   if (a && a.dataset.act === "pick-kernel") {
     const v = $("#dlg-model")?.value; const eff = $("#dlg-effort .on")?.dataset.e || "";
     $("#modal").hidden = true;

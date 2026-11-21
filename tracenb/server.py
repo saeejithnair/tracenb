@@ -1,8 +1,16 @@
-"""HTTP + server-sent events in front of the kernel. Stdlib only."""
+"""HTTP + server-sent events in front of the kernel. Stdlib only.
+
+Who may talk to it: the page it serves itself (same origin), and the hosted page (HOSTED, or any --allow-origin)
+holding the token, which is how that page "connects to a local runtime". Everything else is refused, so another
+website you have open can't drive the kernel (its requests carry its own Origin), and a hostname that merely resolves
+to 127.0.0.1 can't either (Host must be this machine's loopback name).
+"""
 from __future__ import annotations
 
 import json
+import os
 import queue
+import secrets
 import re
 import threading
 import traceback
@@ -12,6 +20,22 @@ from urllib.parse import parse_qs, urlparse
 
 from . import kernel
 from .trace import discover, resolve
+from .world import CACHE
+
+HOSTED = "https://saeejithnair.github.io"  # the hosted page: saeejithnair.github.io/tracenb
+ALLOWED_ORIGINS = {HOSTED}
+
+
+def token() -> str:
+    """The secret the hosted page needs to use this runtime. Kept across restarts, so a page you connected once
+    reconnects whenever tracenb is running."""
+    p = CACHE / "token"
+    if not p.exists():
+        p.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(secrets.token_urlsafe(24))
+    return p.read_text().strip()
 
 STATIC = Path(__file__).parent / "static"
 TYPES = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8",
@@ -68,9 +92,36 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+    def _cors(self):
+        o = self.headers.get("Origin")
+        if o in ALLOWED_ORIGINS:
+            self.send_header("Access-Control-Allow-Origin", o)
+            self.send_header("Vary", "Origin")
+
+    def _allowed(self, query: dict) -> bool:
+        port = self.server.server_address[1]
+        if self.headers.get("Host") not in (f"127.0.0.1:{port}", f"localhost:{port}"):
+            return False
+        o = self.headers.get("Origin")
+        if o is None or o in (f"http://127.0.0.1:{port}", f"http://localhost:{port}"):
+            return True  # this server's own page (or not a browser)
+        tok = self.headers.get("X-Tracenb-Token") or query.get("token")
+        return o in ALLOWED_ORIGINS and tok is not None and secrets.compare_digest(tok, token())
+
+    def do_OPTIONS(self):  # CORS preflight from the hosted page
+        self.send_response(204)
+        self._cors()
+        if self.headers.get("Origin") in ALLOWED_ORIGINS:
+            self.send_header("Access-Control-Allow-Methods", "GET, POST")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Tracenb-Token")
+            self.send_header("Access-Control-Allow-Private-Network", "true")
+            self.send_header("Access-Control-Max-Age", "600")
+        self.end_headers()
+
     def _send(self, code, body, ctype="application/json"):
         data = body if isinstance(body, bytes) else (json.dumps(body) if ctype == "application/json" else body).encode()
         self.send_response(code)
+        self._cors()
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
@@ -84,7 +135,12 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         u = urlparse(self.path)
         q = {k: v[0] for k, v in parse_qs(u.query).items()}
+        if not self._allowed(q):
+            return self._send(403, {"error": "forbidden"})
         try:
+            if u.path == "/api/hello":  # what the hosted page checks when it connects
+                from . import __version__
+                return self._send(200, {"tracenb": __version__})
             if u.path in ("/", "/index.html"):
                 return self._send(200, (STATIC / "index.html").read_bytes(), TYPES[".html"])
             if u.path.startswith("/static/"):
@@ -125,6 +181,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         u = urlparse(self.path)
+        if not self._allowed({k: v[0] for k, v in parse_qs(u.query).items()}):
+            return self._send(403, {"error": "forbidden"})
         try:
             b = self._body()
             if u.path == "/api/open":
@@ -151,6 +209,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {"ok": True})
         except kernel.TraceError as e:
             self._send(400, {"error": str(e)})
+        except FileNotFoundError as e:
+            self._send(404, {"error": str(e)})
         except KeyError as e:
             self._send(404, {"error": f"unknown {e}"})
         except Exception as e:
@@ -159,6 +219,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _events(self, nb):
         self.send_response(200)
+        self._cors()
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-store")
         self.end_headers()

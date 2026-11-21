@@ -383,6 +383,30 @@ class Notebook:
         with self.lock:
             return self._state()
 
+    def snapshot(self) -> dict:
+        """The notebook as one self-contained document: everything the UI shows, plus each take's side panels and
+        full outputs. The hosted page opens it read-only (the demos, and traces you drop on it); no runtime needed."""
+        with self.lock:
+            s = self._state()
+            takes = {**self.takes, **self.checks}
+        # which kernels exist, and their defaults, is a property of the machine running it, not of the notebook:
+        # keep only the names of the ones its versions used
+        used = {(tk.runtime or "").split("@")[0] for tk in takes.values()}
+        s["runtimes"] = [{k: r[k] for k in ("id", "label", "family", "group", "aliases", "model_id")}
+                         for r in s["runtimes"] if r["id"] in used or any(f"{r['family']}:{a}" in used for a in r["aliases"])]
+        views = {}
+        for k, tk in takes.items():
+            v: dict = {}
+            for name, f in (("prompt", self.prompt_for), ("diff", self.diff), ("world", self.world_notes)):
+                try:
+                    v[name] = f(k)
+                except Exception:  # e.g. no world can be built where this runs: that panel just isn't there
+                    pass
+            v["outputs"] = {st["i"]: self.full_output(k, st["i"]) for st in self.take_json(tk)["steps"] if st["truncated"]}
+            views[k] = v
+        s["views"] = views
+        return s
+
     def _state(self) -> dict:
         T = self.T
         spent = sum((tk.run.cost_usd or 0) for tk in self.takes.values() if tk.run)

@@ -139,3 +139,44 @@ def test_runtime_specs_carry_model_and_effort():
     assert (r.harness, r.model, r.effort, r.spec) == ("codex", "gpt-6-luna", "low", "codex:gpt-6-luna@low")
     assert get_runtime("claude:sonnet").spec == "claude:sonnet"  # no effort: the spec (and cache keys) unchanged
     assert get_runtime("codex").spec == "codex"
+
+
+def test_only_this_page_or_the_hosted_page_with_the_token_may_drive_the_server():
+    import threading, urllib.request, urllib.error
+    from tracenb import server
+    srv = server.serve(0)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    port = srv.server_address[1]
+
+    def status(headers, path="/api/hello", host=None):
+        req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", headers=headers)
+        if host:
+            req.add_header("Host", host)
+        try:
+            with urllib.request.urlopen(req) as r:
+                return r.status, r.headers.get("Access-Control-Allow-Origin")
+        except urllib.error.HTTPError as e:
+            return e.code, None
+
+    tok = server.token()
+    assert status({})[0] == 200  # not a browser
+    assert status({"Origin": f"http://127.0.0.1:{port}"})[0] == 200  # its own page
+    assert status({"Origin": "https://evil.example"})[0] == 403  # another website
+    assert status({"Origin": server.HOSTED})[0] == 403  # the hosted page, without the token
+    assert status({"Origin": server.HOSTED, "X-Tracenb-Token": "wrong"})[0] == 403
+    assert status({"Origin": server.HOSTED, "X-Tracenb-Token": tok}) == (200, server.HOSTED)
+    assert status({"Origin": server.HOSTED}, f"/api/hello?token={tok}")[0] == 200  # EventSource can't send headers
+    assert status({}, host="evil.example")[0] == 403  # DNS rebinding
+    srv.shutdown()
+
+
+def test_a_snapshot_is_the_notebook_without_the_machine(tmp_path, repo, fake_runtime):
+    tf = claude_trace(tmp_path / "snapshot.jsonl", repo, [("a", [("tool", "Bash", {"command": "ls"}, "x" * 9000), ("say", "x")])])
+    nb = Notebook(str(tf))
+    tk = wait(nb, nb.submit({"op": "run", "turn": 1, "runtime": "fake", "prompt": "a"}).id)
+    snap = json.loads(json.dumps(nb.snapshot()))  # one plain document
+    assert snap["runtimes"] == [] and set(snap["takes"]) == {"o1", tk.id}  # "fake" isn't a known model
+    assert snap["timeline"] == {"1": tk.id}
+    assert "fake.txt" in snap["views"][tk.id]["diff"]          # the side panels travel with it
+    assert snap["views"][tk.id]["prompt"].strip()
+    assert snap["takes"]["o1"]["steps"][0]["truncated"] and len(snap["views"]["o1"]["outputs"]["1"]) == 9000

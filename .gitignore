@@ -5,3 +5,5 @@ __pycache__/
 notebooks/
 __marimo__/
 .pytest_cache/
+.scratch/
+site-build/

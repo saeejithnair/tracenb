@@ -317,3 +317,27 @@ table.keys td { padding: 3px 12px 3px 0; }
 .kernel { font-size: 13px; }
 
 #every-effort { max-width: none; }
+
+/* the hosted page's home: demos, a drop zone for trace files, connecting a local runtime */
+.site-intro { padding: 16px 12px 4px; max-width: 760px; color: var(--ink1); line-height: 1.55; }
+.site-intro p { margin: 0; }
+.sec-h { margin: 18px 0 0; padding: 6px 12px; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--ink2);
+  border-bottom: 1px solid var(--border2); }
+.sec-h .hint { text-transform: none; letter-spacing: 0; }
+a.file-row { text-decoration: none; color: inherit; }
+.drop { display: block; margin: 10px 12px; padding: 18px 16px; border: 1px dashed var(--border2); border-radius: 2px; cursor: pointer;
+  color: var(--ink1); background: var(--layout0); line-height: 1.6; }
+.drop .hint { display: block; font-size: 12px; }
+.drop:hover, .drop.over { border-color: var(--brand1); background: var(--editor-bg); }
+.drop.busy { cursor: progress; opacity: .8; }
+.connect-row { display: flex; align-items: center; gap: 16px; padding: 12px; }
+.connect-row p { margin: 0; flex: 1; color: var(--ink1); }
+.steps { padding-left: 20px; }
+.steps li { margin: 10px 0; }
+.cmd { margin: 6px 0 0; padding: 6px 10px; background: var(--editor-bg); border: 1px solid var(--border2); font: 12px var(--code-font);
+  white-space: pre-wrap; word-break: break-all; user-select: all; }
+.conn-in { display: flex; gap: 8px; margin-top: 6px; }
+.jp-input { flex: 1; height: 28px; padding: 0 8px; border: 1px solid var(--border2); border-radius: 2px; font: 12px var(--code-font);
+  background: var(--layout0); color: var(--ink1); }
+.jp-input:focus { outline: none; border-color: var(--brand1); }
+@media (max-width: 700px) { .connect-row { flex-direction: column; align-items: stretch; } }

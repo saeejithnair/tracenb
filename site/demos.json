@@ -1,0 +1,8 @@
+[
+  {"id": "failing-test", "ref": "b66c321a-fbc4-4748-8155-29389bb2a949", "title": "Why is a test failing?",
+   "blurb": "Claude Code, 3 turns. Versions: other models, a faked test result, an edited command, Haiku taking over mid-turn"},
+  {"id": "csv-questions", "ref": "fe791c0a-b4df-4f17-a4d9-d6c76f63e902", "title": "Questions about a CSV",
+   "blurb": "Claude Code, 2 turns. Versions: the question asked differently, a faked count, a smaller model"},
+  {"id": "codex-cli", "ref": "~/personal/tracenb-demos/traces/rollout-2026-11-21T12-56-16-01a1ff40-73e1-7c60-9ca6-afcb023125be.jsonl", "title": "Adding features to a CLI",
+   "blurb": "Codex, 2 turns. Versions: Claude on the same request, low vs high effort, Claude taking over from Codex"}
+]

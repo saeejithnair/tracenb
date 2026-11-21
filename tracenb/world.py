@@ -194,7 +194,7 @@ class World:
                 out.append(f"{status}: {path} (binary)")
                 continue
             out.append("".join(difflib.unified_diff(a.splitlines(True), b.splitlines(True),
-                                                    f"a{path}", f"b{path}", n=2)) or f"{status}: {path}")
+                                                    path, path, n=2)) or f"{status}: {path}")
         return "\n".join(out)
 
     # ---- sandboxing
