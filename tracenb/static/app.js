@@ -54,8 +54,12 @@ async function http(method, p, b) {
   let r;
   try {
     r = await fetch(conn.base + p, { method, body: b ? JSON.stringify(b) : undefined,
+      ...(SITE ? { targetAddressSpace: "loopback" } : {}),  // Chrome asks you before a website may reach this machine
       headers: { ...(b ? { "Content-Type": "application/json" } : {}), ...(conn.token ? { "X-Tracenb-Token": conn.token } : {}) } });
-  } catch { throw new Error(SITE ? "Can't reach tracenb on this machine. Is it running? (tracenb --no-browser)" : "Can't reach the tracenb server"); }
+  } catch {
+    throw new Error(SITE ? "Can't reach tracenb on this machine. Is it running (tracenb --no-browser)? If your browser asked whether this page may access apps on your device, allow it; if you blocked it, allow it in the site settings (the icon left of the address)."
+      : "Can't reach the tracenb server");
+  }
   const j = await r.json().catch(() => ({}));
   if (r.status === 403 && SITE) throw new Error("tracenb refused this page. Reconnect with the link it prints when it starts.");
   if (!r.ok) throw new Error(j.error || r.statusText);
