@@ -238,8 +238,10 @@ async function library() {
     <div class="browser-bar"><input id="q" placeholder="Filter sessions by title, project or first message — or paste a path to a .jsonl and press Enter" autofocus></div>
     <div class="browser-hd"><span class="c-name">Name</span><span class="c-proj">Project</span><span class="c-turns">Turns</span><span class="c-mod">Last Modified</span></div>
     <div id="list"><div class="empty">Loading sessions…</div></div>`}
+    ${SITE?.film ? filmCellHTML() : ""}
   </div></div>`;
   if (SITE) wireDrop();
+  if (SITE?.film) wireFilm();
   if (!sessions) return;
   const q = $("#q");
   let traces = [];
@@ -319,6 +321,29 @@ function wireDrop() {
   drop.ondragover = (e) => { e.preventDefault(); drop.classList.add("over"); };
   drop.ondragleave = () => drop.classList.remove("over");
   drop.ondrop = (e) => { e.preventDefault(); drop.classList.remove("over"); e.dataTransfer.files[0] && openFile(e.dataTransfer.files[0]); };
+}
+
+/* The overview film, as a notebook cell: run it (click it, ▶ Run, or Shift+Enter) and its output plays.
+   [*] while it loads, then [n] like an execution count. */
+function filmCellHTML() {
+  return `<div class="film-nb"><div class="jp-cell film-cell" id="film" tabindex="0">
+    <div class="in-wrap"><div class="collapser"></div><div class="prompt in">[ ]:</div>
+      <div class="in-area"><div class="editor ro"><div class="cell-tb"><button class="go" data-film="run">▶ Run</button></div><pre>Video(<span class="py-s">"${esc(SITE.film.src)}"</span>)</pre></div></div></div>
+    <div class="out-wrap"><div class="collapser"></div><div class="prompt out"></div>
+      <div class="out-area"><video src="${esc(SITE.film.src)}" poster="${esc(SITE.film.poster)}" playsinline preload="none"></video></div></div>
+  </div></div>`;
+}
+function wireFilm() {
+  const cell = $("#film"), v = cell.querySelector("video"), pin = cell.querySelector(".prompt.in"), pout = cell.querySelector(".prompt.out");
+  let n = 0;
+  const run = () => {
+    pin.textContent = "[*]:"; pout.textContent = "";
+    v.controls = true; v.currentTime = 0; v.play();
+  };
+  v.onplaying = () => { if (pin.textContent === "[*]:") { n++; pin.textContent = pout.textContent = `[${n}]:`; } };
+  cell.onclick = (e) => { cell.classList.add("active"); if (e.target.closest("[data-film=run]") || (e.target === v && !v.controls)) run(); };
+  cell.onkeydown = (e) => { if (e.key === "Enter" && e.shiftKey) { e.preventDefault(); run(); } };
+  cell.addEventListener("focusout", (e) => { if (!cell.contains(e.relatedTarget)) cell.classList.remove("active"); });
 }
 
 /* A trace file is opened by tracenb itself, running in the page (Pyodide): the same importer as the local tool. */
@@ -509,7 +534,7 @@ function renderAll() {
     const a = document.activeElement;
     const keep = a && sec.contains(a) && a.dataset.key ? { key: a.dataset.key, s: a.selectionStart, e: a.selectionEnd } : null;
     sec.innerHTML = html;
-    if (keep) { const el = sec.querySelector(`[data-key="${CSS.escape(keep.key)}"]`); if (el) { el.focus(); el.setSelectionRange(keep.s, keep.e); } }
+    if (keep) { const el = sec.querySelector(`[data-key="${CSS.escape(keep.key)}"]`); if (el) { el.focus({ preventScroll: true }); el.setSelectionRange(keep.s, keep.e); } }
     sec.querySelectorAll("textarea").forEach(autosize);
   }
   if (ui.follow) {
@@ -750,7 +775,12 @@ function compareHTML(t, sibs) {
   }).join("") + `</div><div class="compare-note">Highlighted calls are ones the recorded version didn't make.</div>`;
 }
 
-function autosize(el) { el.style.height = "auto"; el.style.height = Math.min(el.scrollHeight + 2, window.innerHeight * 0.7) + "px"; }
+// Measuring needs height:auto for a moment, which can shrink the page and clamp the scroll; put the scroll back.
+function autosize(el) {
+  const sc = el.closest(".scroll"), top = sc?.scrollTop;
+  el.style.height = "auto"; el.style.height = Math.min(el.scrollHeight + 2, window.innerHeight * 0.7) + "px";
+  if (sc) sc.scrollTop = top;
+}
 
 // ------------------------------------------------------------------ running
 /* What running from cell (t, i) means: the op that makes the new version of turn t — this cell stands as
@@ -866,7 +896,7 @@ function startEdit(key) {
   if (!(key in ui.drafts)) ui.drafts[key] = original(key);
   ui.editing = key;
   renderAll();
-  setTimeout(() => { const el = document.querySelector(`textarea[data-key="${CSS.escape(key)}"]`); if (el) { el.focus(); autosize(el); } }, 0);
+  setTimeout(() => { const el = document.querySelector(`textarea[data-key="${CSS.escape(key)}"]`); if (el) { el.focus({ preventScroll: true }); autosize(el); } }, 0);
 }
 function stopEdit() {
   if (ui.editing && !dirty(ui.editing)) delete ui.drafts[ui.editing];

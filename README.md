@@ -2,6 +2,8 @@
 
 Open any agent trace — a Claude Code or Codex session — as a notebook you can re-run.
 
+[![tracenb in 43 seconds: play the overview film](site/tracenb-overview-play.jpg)](https://saeejithnair.github.io/tracenb/tracenb-overview.mp4)
+
 ```
 tracenb                 # library of your recent sessions
 tracenb open latest     # the most recent one

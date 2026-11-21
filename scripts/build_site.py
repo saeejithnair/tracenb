@@ -48,6 +48,10 @@ def main(manifest: str, out: str):
         print(f"demo {d['id']}: {len(text) // 1024} KB, {len(nb.takes)} versions")
 
     site = {"demos": demos, "wheel": wheel, "pyodide": PYODIDE, "install": INSTALL}
+    if (ROOT / "site" / "tracenb-overview.mp4").exists():  # the overview film, a cell at the bottom of the page
+        for f in ("tracenb-overview.mp4", "tracenb-overview.jpg"):
+            shutil.copy(ROOT / "site" / f, out_dir / f)
+        site["film"] = {"src": "tracenb-overview.mp4", "poster": "tracenb-overview.jpg"}
     html = (ROOT / "tracenb" / "static" / "index.html").read_text()
     html = html.replace("<!--tracenb-site-->", f"<script>window.TRACENB_SITE = {json.dumps(site)};</script>")
     (out_dir / "index.html").write_text(html)
