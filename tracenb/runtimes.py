@@ -128,8 +128,10 @@ def build_prompt(steps: list[Step], world: World, budget_chars: int = 160_000) -
 # ---------------------------------------------------------------- runners
 OnStep = Callable[[list[Step]], None]
 
-CLAUDE_STATE = [f"{HOME}/.claude", f"{HOME}/.cache", f"{HOME}/Library/Caches", f"{HOME}/.local/state",
-                f"{HOME}/.local/share", f"{HOME}/.npm", f"{HOME}/Library/Application Support"]
+# Where the claude CLI keeps its own state (SBPL filters). World.sandbox_profile carves the traces,
+# the user's configuration and tracenb's cache back out of these.
+CLAUDE_STATE = tuple(f'(subpath "{HOME}/{d}")' for d in (".claude", ".cache", "Library/Caches", ".local/state",
+                                                          ".local/share", ".npm")) + (f'(regex #"^{HOME}/\\.claude\\.json")',)
 
 
 class Runtime:
@@ -146,10 +148,10 @@ class Runtime:
             cancel=None) -> Run:
         raise NotImplementedError
 
-    def _stream(self, argv, prompt, cwd, handle, log_path, cancel=None) -> tuple[int, str]:
+    def _stream(self, argv, prompt, cwd, handle, log_path, cancel=None, env=None) -> tuple[int, str]:
         Path(log_path).parent.mkdir(parents=True, exist_ok=True)
         with open(log_path, "w") as log:
-            p = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            p = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                  stderr=subprocess.PIPE, text=True, errors="replace")
             p.stdin.write(prompt)
             p.stdin.close()
@@ -220,7 +222,7 @@ class Claude(Runtime):
         if budget_usd:
             argv += ["--max-budget-usd", str(budget_usd)]
         log = CACHE / "logs" / f"{int(t0 * 1000)}-claude.jsonl"
-        rc, err = self._stream(argv, prompt, world.to_world(world.home), handle, log, cancel)
+        rc, err = self._stream(argv, prompt, world.to_world(world.home), handle, log, cancel, env=world.env())
         run.log, run.duration_s = str(log), time.time() - t0
         if cancel is not None and cancel.is_set():
             run.error = "stopped"
@@ -285,12 +287,15 @@ class Codex(Runtime):
 
         cwd = world.to_world(world.home)
         argv = ["codex", "exec", "--json", "--skip-git-repo-check", "--ephemeral", "-s", "workspace-write",
-                "-c", "sandbox_workspace_write.network_access=true", "-C", cwd]
+                "-c", "sandbox_workspace_write.network_access=true",
+                # writable: the whole world (every mount, its own temp dir) — not the machine's /tmp
+                "-c", f"sandbox_workspace_write.writable_roots={json.dumps([str(world.root)])}",
+                "-c", "sandbox_workspace_write.exclude_slash_tmp=true", "-C", cwd]
         if self.model:
             argv += ["-m", self.model]
         argv.append("-")
         log = CACHE / "logs" / f"{int(t0 * 1000)}-codex.jsonl"
-        rc, err = self._stream(argv, prompt, cwd, handle, log, cancel)
+        rc, err = self._stream(argv, prompt, cwd, handle, log, cancel, env=world.env())
         run.log, run.duration_s = str(log), time.time() - t0
         if cancel is not None and cancel.is_set():
             run.error = "stopped"

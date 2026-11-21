@@ -17,12 +17,13 @@ import hashlib
 import json
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 from .runtimes import Run, build_prompt, get_runtime
 from .tools import SHELLS, execute, is_native, replayable, same_result
 from .trace import Step, Trace, load as load_trace
-from .world import CACHE, World, base_world, publish, scratch_name
+from .world import CACHE, World, base_world, publish, scratch_name, world_id
 
 RECORDED, LIVE = "recorded", "live"
 
@@ -37,6 +38,37 @@ class NotCached(TraceError):
 
 def _h(*parts) -> str:
     return hashlib.sha256("\x1f".join(map(str, parts)).encode()).hexdigest()[:20]
+
+
+# Every expensive result (an execution, a rebuilt world, a re-run, a runtime run) is computed at
+# most once per key: concurrent requests for the same key wait for the first and read its result.
+_flights: dict[str, threading.Lock] = {}
+_flights_lock = threading.Lock()
+
+
+def _once(key: str) -> threading.Lock:
+    with _flights_lock:
+        return _flights.setdefault(key, threading.Lock())
+
+
+# Restoring a notebook rebuilds its takes from the cache and must never compute anything.
+_mode = threading.local()
+
+
+@contextmanager
+def cached_only():
+    prev = getattr(_mode, "cached_only", False)
+    _mode.cached_only = True
+    try:
+        yield
+    finally:
+        _mode.cached_only = prev
+
+
+def _compute(what: str):
+    """Called just before computing something that isn't cached."""
+    if getattr(_mode, "cached_only", False):
+        raise NotCached(f"{what} has no cached result")
 
 
 class Session:
@@ -67,9 +99,8 @@ class Node:
         self.S, self.parent, self._step, self.state = S, parent, step, state
         self.rec = rec if rec is not None else (step if state == RECORDED else None)  # what this replaced
         self.run, self.branch = run, None
-        self._lock = threading.Lock()
         if parent is None:
-            self.key, self.label, self.turn = _h("root", S.trace.id, S.trace.source), "start", 0
+            self.key, self.label, self.turn = _h("root", world_id(S.trace)), "start", 0
             return
         if state == RECORDED:
             self.key = _h(parent.key, "rec", step.id)
@@ -126,7 +157,7 @@ class Node:
     def step(self) -> Step:
         st = self._step
         if self.state == LIVE and st.kind == "tool" and st.output is None:
-            with self._lock:
+            with _once(self.key):
                 if self._step.output is None:
                     self._step = self._execute()
             st = self._step
@@ -137,6 +168,7 @@ class Node:
         snap = CACHE / "worlds" / self.key
         if cache.exists() and (snap / ".tracenb.json").exists():
             return Step.from_json(json.loads(cache.read_text()))
+        _compute(f"{self._step.tool} at {self.label}")
         w = self.parent.world().fork(self.key)
         t0 = time.time()
         st = execute(self._step, w, self.S.trace.harness)
@@ -176,7 +208,7 @@ class Node:
         if self.parent is None or self.kind != "tool" or self.executed or self.branch is not None:
             return False
         st = self._step if self._step is not None else self.rec
-        if st.meta.get("via") in ("forced", "replayed", "kept"):
+        if st.meta.get("via") in ("forced", "kept"):  # given, not performed: no effect on the files
             return False
         if st.tool in SHELLS:
             return not st.input.get("run_in_background")
@@ -206,6 +238,13 @@ class Node:
 
     def _rebuild_from(self, before: World) -> World:
         final = CACHE / "worlds" / f"at-{self.key}"
+        with _once(f"at-{self.key}"):
+            if (final / ".tracenb.json").exists():
+                return World.open(final)
+            _compute(f"the world after {self.label}")
+            return self._rebuild(before, final)
+
+    def _rebuild(self, before: World, final: Path) -> World:
         st = self.step
         w = before.fork(scratch_name(f"at-{self.key}"))
         redo = execute(st.with_(output=None, error=False), w, self.S.trace.harness, offline=True)
@@ -224,18 +263,30 @@ class Node:
         Returns {output, error, same} (same: did the world answer as it did in the trace?)."""
         if self.kind != "tool":
             raise TraceError("only tool calls can be re-run")
+        rp = CACHE / "replays" / f"{self.key}.json"
         if self._effectful():
             self.world()  # rebuilding the world re-runs it and keeps the result
-            return json.loads((CACHE / "replays" / f"{self.key}.json").read_text())
+            return json.loads(rp.read_text())
         st = self.step
         if not is_native(st):
             return {"output": st.output, "error": st.error, "same": True, "kept": True}
-        redo = execute(st.with_(output=None, error=False), self.parent.world(), self.S.trace.harness, offline=True)
-        return {"output": redo.output, "error": redo.error, "same": same_result(st, redo.output, redo.error)}
+        with _once(f"replay-{self.key}"):
+            if rp.exists():
+                return json.loads(rp.read_text())
+            _compute(f"re-running {self.label}")
+            w = self.parent.world().fork(scratch_name(f"replay-{self.key}"))  # never the shared world
+            try:
+                redo = execute(st.with_(output=None, error=False), w, self.S.trace.harness, offline=True)
+            finally:
+                w.discard()
+            r = {"output": redo.output, "error": redo.error, "same": same_result(st, redo.output, redo.error)}
+            rp.parent.mkdir(parents=True, exist_ok=True)
+            rp.write_text(json.dumps(r))
+            return r
 
     # ------------------------------------------------------------ continuing with a runtime
     def resume(self, runtime: str = "claude", budget_usd: float = 3.0, sample: int = 0,
-               context_chars: int = 160_000, on_step=None, cancel=None, cached_only: bool = False) -> "Node":
+               context_chars: int = 160_000, on_step=None, cancel=None) -> "Node":
         """Let `runtime` continue the conversation from this node to the end of the turn.
 
         Returns the new tip; displaying it shows the whole new branch next to the original."""
@@ -244,11 +295,15 @@ class Node:
         key = _h(self.key, runtime, sample, context_chars)
         cache = CACHE / "runs" / f"{key}.json"
         snap = CACHE / "worlds" / f"run-{key}"
+        with _once(f"run-{key}"):
+            run = self._run(runtime, key, cache, snap, budget_usd, context_chars, on_step, cancel)
+        return self._graft(run, key)
+
+    def _run(self, runtime, key, cache, snap, budget_usd, context_chars, on_step, cancel) -> Run:
         if cache.exists() and (snap / ".tracenb.json").exists():
             run = Run.from_json(json.loads(cache.read_text()))
-        elif cached_only:
-            raise NotCached(f"{runtime} from {self.label} has no cached result")
         else:
+            _compute(f"{runtime} from {self.label}")
             steps = self.steps()
             w = self.world().fork(f"run-{key}")
             prompt = build_prompt(steps, w, context_chars)
@@ -258,7 +313,7 @@ class Node:
             if not run.steps:
                 raise TraceError(f"{runtime} produced nothing: {run.error or 'no output'} (log: {run.log})")
             cache.write_text(json.dumps(run.to_json()))
-        return self._graft(run, key)
+        return run
 
     def _graft(self, run: Run, key: str) -> "Node":
         n, nodes = self, []

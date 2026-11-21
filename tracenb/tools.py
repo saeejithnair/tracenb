@@ -20,6 +20,7 @@ import os
 import re
 import shlex
 import subprocess
+import sys
 from pathlib import Path
 
 from .trace import Step
@@ -54,7 +55,7 @@ def run_shell(cmd: str, world: World, workdir: str | None = None, timeout_s: flo
     # run the command, then note where the shell ended up (Claude Code resets it if it left the project)
     wrapped = f"{world.to_world(cmd)}\n__tnb_rc=$?; pwd -P > {shlex.quote(str(marker))} 2>/dev/null; exit $__tnb_rc"
     try:
-        r = subprocess.run(["sandbox-exec", "-f", prof, "/bin/zsh", "-c", wrapped], cwd=cwd,
+        r = subprocess.run(["sandbox-exec", "-f", prof, "/bin/zsh", "-c", wrapped], cwd=cwd, env=world.env(),
                            capture_output=True, text=True, timeout=timeout_s, errors="replace")
     except subprocess.TimeoutExpired:
         return f"Command timed out after {timeout_s:.0f}s", True
@@ -152,9 +153,17 @@ def _grep(inp, world):
 
 def _glob_tool(inp, world):
     base = Path(world.to_world(inp.get("path") or world.home))
-    hits = [Path(h) for h in _glob.glob(str(base / inp["pattern"]), recursive=True)]
+    hits = [Path(h) for h in _glob.glob(str(base / world.to_world(inp["pattern"])), recursive=True)]
     hits.sort(key=lambda h: h.stat().st_mtime if h.exists() else 0, reverse=True)
     return world.from_world("\n".join(map(str, hits[:100]))) or "No files found", False
+
+
+def _find_lines(text: str, block: str, pos: int) -> int:
+    """First occurrence of `block` (whole lines) in `text` at or after `pos`, or -1."""
+    at = text.find(block, pos)
+    while at > 0 and text[at - 1] != "\n":
+        at = text.find(block, at + 1)
+    return at
 
 
 # ---- codex apply_patch (the "*** Begin Patch" envelope)
@@ -192,14 +201,22 @@ def apply_patch(patch: str, world: World) -> tuple[str, bool]:
                 if i < len(lines) and lines[i].startswith("*** Move to: "):
                     dst = path_of(lines[i][13:])
                     i += 1
-                text = src.read_text()
+                text, pos = src.read_text(), 0
                 while i < len(lines) and not lines[i].startswith("*** ") or (i < len(lines) and lines[i].startswith("*** End of File")):
                     if lines[i].startswith("*** End of File"):
                         i += 1
                         continue
-                    # one hunk: optional "@@ ctx" header, then ' '/'-'/'+' lines
+                    # one hunk: optional "@@ ctx" header (a line to find first), then ' '/'-'/'+' lines.
+                    # Hunks apply in order: each search starts where the previous one ended.
                     if lines[i].startswith("@@"):
+                        ctx = lines[i][2:].strip()
                         i += 1
+                        if ctx:
+                            at = text.find(ctx, pos)
+                            if at < 0:
+                                raise ValueError(f"context '{ctx}' not found in {l[17:]}")
+                            nl = text.find("\n", at)
+                            pos = len(text) if nl < 0 else nl + 1
                     old, new = [], []
                     while i < len(lines) and not lines[i].startswith(("@@", "*** ")):
                         t, body = (lines[i][:1], lines[i][1:]) if lines[i] else (" ", "")
@@ -208,10 +225,20 @@ def apply_patch(patch: str, world: World) -> tuple[str, bool]:
                         if t in (" ", "+"):
                             new.append(body)
                         i += 1
-                    o, n = "\n".join(old), "\n".join(new)
-                    if o not in text:
+                    if not old:  # pure addition: after the anchor, or at the end of the file
+                        at = pos if pos else len(text)
+                        ins = "\n".join(new) + "\n"
+                        if at and not text[:at].endswith("\n"):
+                            ins = "\n" + ins
+                        text, pos = text[:at] + ins + text[at:], at + len(ins)
+                        continue
+                    o, n = "\n".join(old) + "\n", "\n".join(new) + "\n"
+                    at = _find_lines(text, o, pos)
+                    if at < 0 and text.endswith(o[:-1]) and _find_lines(text + "\n", o, pos) >= 0:  # no final newline
+                        o, n, at = o[:-1], n[:-1], _find_lines(text + "\n", o, pos)
+                    if at < 0:
                         raise ValueError(f"hunk does not apply to {l[17:]}")
-                    text = text.replace(o, n, 1)
+                    text, pos = text[:at] + n + text[at + len(o):], at + len(n)
                 dst.write_text(text)
                 if dst != src:
                     src.unlink()
@@ -259,6 +286,40 @@ def _oracle(step: Step, world: World, harness: str) -> tuple[str, bool]:
     return world.from_world(out), out.startswith("ORACLE_ERROR") or run.error is not None
 
 
+# ---------------------------------------------------------------- sandboxed native execution
+_PKG = str(Path(__file__).resolve().parent.parent)
+
+
+def _native(step: Step, world: World, offline: bool) -> tuple[str, bool]:
+    """Run a native file tool in a child process under the world's sandbox — the same single write
+    rule as the shell: nothing outside the world can be written, whatever path the call names."""
+    job = json.dumps({"tool": step.tool, "input": step.input, "root": str(world.root)})
+    boot = f"import sys; sys.path.insert(0, {_PKG!r}); from tracenb.tools import _native_child; _native_child()"
+    r = subprocess.run(["sandbox-exec", "-f", world.sandbox_profile(offline=offline), sys.executable, "-I", "-c", boot],
+                       input=job, capture_output=True, text=True, cwd=world.to_world(world.home), env=world.env(),
+                       timeout=300, errors="replace")
+    try:
+        res = json.loads(r.stdout.strip().splitlines()[-1])
+    except (IndexError, ValueError):
+        return f"tool failed: {(r.stderr or r.stdout).strip()[-2000:]}", True
+    return res["out"], res["err"]
+
+
+def _native_child():
+    job = json.loads(sys.stdin.read())
+    world = World.open(Path(job["root"]))
+    try:
+        if job["tool"] == "apply_patch":
+            out, err = apply_patch(job["input"].get("input") or job["input"].get("patch", ""), world)
+        else:
+            out, err = NATIVE[job["tool"]](job["input"], world)
+    except PermissionError as e:
+        out, err = f"{e.strerror or 'Operation not permitted'}: {e.filename} (outside the reconstructed world)", True
+    except Exception as e:
+        out, err = f"{type(e).__name__}: {e}", True
+    print(json.dumps({"out": out, "err": bool(err)}))
+
+
 # ---------------------------------------------------------------- entry points
 def execute(step: Step, world: World, harness: str, offline: bool = False) -> Step:
     """Run `step`'s action in `world` (mutating it). Returns the step with its observation.
@@ -269,11 +330,8 @@ def execute(step: Step, world: World, harness: str, offline: bool = False) -> St
             t = float(step.input.get("timeout") or 120000) / 1000 if step.tool == "Bash" else 120
             out, err = run_shell(cmd, world, wd, timeout_s=min(t, 600), harness=harness, offline=offline)
             via = "native"
-        elif step.tool == "apply_patch":
-            out, err = apply_patch(step.input.get("input") or step.input.get("patch", ""), world)
-            via = "native"
-        elif step.tool in NATIVE:
-            out, err = NATIVE[step.tool](step.input, world)
+        elif step.tool in NATIVE or step.tool == "apply_patch":
+            out, err = _native(step, world, offline)
             via = "native"
         elif offline:
             return step.with_(output="(not re-run: needs a model)", error=False, meta={**step.meta, "via": "kept"})

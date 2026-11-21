@@ -30,8 +30,9 @@ everything below it with the original messages). Keyboard: `j`/`k`, `e`, `⇧⏎
 node is a step on some timeline: *recorded* (identical to the trace — free) or *live* (anything else: an edited
 step, a faked observation, a step produced by a runtime). A cell you leave alone stays recorded; change anything
 and you're on a new timeline. Everything expensive is memoized by a content key (the path's actions + runtime +
-sample), so reopening a notebook replays every result from cache; asking for the same thing twice draws a new
-sample.
+sample), so reopening a notebook replays every result from cache and never computes anything (unfinished work
+comes back as "interrupted"); asking for the same thing twice draws a new sample; deleting a take discards its result.
+Identical requests in flight at once are computed once.
 
 **Worlds.** Executing a tool call needs the files as they were *at that point*. The base world is the project's
 git repo at the last commit before the session started, plus the session's own pre-edit backups (Claude Code keeps
@@ -41,8 +42,11 @@ the session's shell commands **re-run offline** (network denied, so nothing reac
 are APFS copy-on-write clones — cheap — and paths are relocated between "trace space" and "world space" at the
 boundary, so the agent sees the same paths it saw originally.
 
-**Sandbox.** Every execution runs under `sandbox-exec`: writes are allowed only inside the world (and temp dirs).
-Your real repo and files are never written. Codex runs inside its own equivalent `workspace-write` sandbox.
+**Sandbox.** One rule: only the world is writable. Shell commands *and* the file tools (Write, Edit, apply_patch…)
+run in child processes under `sandbox-exec`; each world has its own temp dir (`TMPDIR`), and the machine's `/tmp` is
+not writable. The claude CLI may also write its own state, but never `~/.claude/projects`, your settings, skills
+or hooks, or tracenb's cache. Codex runs in its own `workspace-write` sandbox with the world as its writable root.
+A command that tries to write outside the world fails visibly ("operation not permitted"), and agents adapt.
 
 **Runtimes.** A runtime is an agent harness + model (`claude -p …`, `codex exec …`). Every runtime gets the history
 the same way: a neutral transcript, with the session's original date, ending where the take forks. That makes
@@ -57,10 +61,13 @@ Shown per take under **world fidelity**. Known gaps:
 - shell commands that needed the network (curl, git fetch) can't be re-run offline, so files they produced are missing;
 - files written by subagents or other model-mediated tools aren't reproduced (those calls are kept as recorded);
 - reads outside the project and outside any directory the session wrote to see the machine as it is *today*;
+- commands that wrote to `/tmp` (rather than the session's scratch dir) can't be reproduced: `/tmp` isn't in the world;
+- a session that's still in progress gets a fresh base world (and fresh cache keys) each time it touches a new file;
 - Codex "code mode" calls (`exec` with JavaScript) and other non-native tools are executed through an *oracle*
   (the harness is asked to perform exactly that call), which is model-mediated and marked as such.
 
-The replay button measures all of this directly: on a long real session, turn 1's six calls reproduce 5/6 exactly.
+The replay button measures all of this directly: on a long real session, turn 1 reproduces 5/6 calls exactly and turn 25 3/5; turns
+14 and 20 (0/2) read files that earlier `curl` downloads produced, which an offline rebuild can't fetch.
 
 ## Layout
 

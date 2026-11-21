@@ -163,6 +163,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         q: queue.Queue = queue.Queue(maxsize=1000)
         nb.listeners.append(q)
+        q.put({"type": "state", "state": nb.state()})  # whatever happened before we subscribed
         try:
             while True:
                 try:

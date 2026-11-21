@@ -123,7 +123,8 @@ class World:
         if isinstance(s, str):
             table = self._table(reverse)
             # one pass, longest key first, so replaced text is never rescanned
-            pat = re.compile("|".join(re.escape(k) for k in sorted(table, key=len, reverse=True)))
+            # and only as a whole path prefix: /x/proj must not match inside /x/proj-other
+            pat = re.compile("(?:" + "|".join(re.escape(k) for k in sorted(table, key=len, reverse=True)) + r")(?![\w.\-+@~])")
             return pat.sub(lambda m: table[m.group(0)], s)
         if isinstance(s, dict):
             return {k: self._sub(v, reverse) for k, v in s.items()}
@@ -195,21 +196,58 @@ class World:
             out.append(f"re-applied {s['edit_rerun']} file edit(s); {s.get('edit_same', 0)} applied as recorded")
         return out
 
-    def sandbox_profile(self, extra_writable: list[str] = (), offline: bool = False) -> str:
-        writable = [str(self.root), "/private/tmp", "/private/var/folders", "/dev", *extra_writable]
-        rules = " ".join(f'(subpath "{p}")' for p in writable)
-        prof = f'(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write* {rules} (regex #"^{HOME}/\\.claude\\.json"))\n'
+    @property
+    def tmp(self) -> Path:
+        """This world's own temp dir: executions get it as TMPDIR, never the machine's."""
+        t = self.root / ".tmp"
+        t.mkdir(exist_ok=True)
+        return t
+
+    def env(self) -> dict:
+        t = str(self.tmp)
+        # CLAUDE_CODE_TMPDIR: the claude CLI keeps its per-project temp dir there instead of /tmp
+        return {**os.environ, "TMPDIR": t + "/", "TMPPREFIX": t + "/zsh", "CLAUDE_CODE_TMPDIR": t}
+
+    def sandbox_profile(self, harness_state: tuple[str, ...] = (), offline: bool = False) -> str:
+        """The one write rule: only this world (and /dev) is writable. A runtime's harness may also
+        write its own state (`harness_state`: SBPL filters), but never the traces, the user's
+        configuration, or tracenb's cache — other worlds included. Later SBPL rules win."""
+        prof = "(version 1)\n(allow default)\n(deny file-write*)\n"
+        if harness_state:
+            prof += f"(allow file-write* {' '.join(harness_state)})\n"
+            protected = [str(CACHE), f"{HOME}/.claude/projects", f"{HOME}/.claude/file-history",
+                         f"{HOME}/.claude/CLAUDE.md", f"{HOME}/.claude/settings.json",
+                         f"{HOME}/.claude/settings.local.json", f"{HOME}/.claude/skills", f"{HOME}/.claude/agents",
+                         f"{HOME}/.claude/commands", f"{HOME}/.claude/hooks", f"{HOME}/.codex/sessions"]
+            prof += f"(deny file-write* {' '.join(f'(subpath {json.dumps(os.path.realpath(p))})' for p in protected)})\n"
+        # the sandbox matches resolved paths (/var/folders is really /private/var/folders)
+        prof += f'(allow file-write* (subpath {json.dumps(os.path.realpath(self.root))}) (subpath "/dev"))\n'
         if offline:  # rebuilding/replaying must never reach the outside world again
-            prof += '(deny network-outbound (remote ip))\n'
+            prof += "(deny network-outbound (remote ip))\n"
         p = self.root.parent / f"{self.root.name}{'.offline' if offline else ''}.sb"
         p.write_text(prof)
         return str(p)
 
+    def discard(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+        for p in self.root.parent.glob(f"{self.root.name}*.sb"):
+            p.unlink(missing_ok=True)
+
 
 # ---------------------------------------------------------------- base world
+def world_id(trace) -> str:
+    """Identity of a trace's base world: everything base_world() is built from. A session still in
+    progress gets a new base world (and new cache keys) once it touches a new file."""
+    writes = sorted({s.input.get("file_path") or s.input.get("notebook_path") or "" for s in trace.steps
+                     if s.kind == "tool" and s.tool in ("Write", "Edit", "MultiEdit", "NotebookEdit")})
+    ident = [trace.id, trace.source, trace.cwd, trace.started, trace.git_branch, trace.scratch,
+             sorted((trace.file_history or {}).items(), key=lambda kv: kv[0]), writes]
+    return hashlib.sha256(json.dumps(ident, default=str).encode()).hexdigest()[:16]
+
+
 def base_world(trace) -> World:
     """The trace's mount points as they were when the session started (best reconstruction)."""
-    root = CACHE / "worlds" / f"base-{trace.id}-{hashlib.sha256(trace.source.encode()).hexdigest()[:8]}"
+    root = CACHE / "worlds" / f"base-{trace.id[:12]}-{world_id(trace)}"
     if (root / ".tracenb.json").exists():
         return World.open(root)
     tmp = root.with_name(scratch_name(root.name))

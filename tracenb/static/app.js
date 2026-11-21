@@ -176,7 +176,8 @@ async function openNotebook(id) {
   es.onmessage = (m) => {
     const ev = JSON.parse(m.data);
     if (ev.type === "state") { S = ev.state; renderAll(); }
-    else if (ev.type === "take") { S.takes[ev.take.id] = ev.take; renderCell(ev.take.turn); renderMap(); }
+    // a late update for a take that has since been deleted must not bring it back
+    else if (ev.type === "take" && S.takes[ev.take.id]) { S.takes[ev.take.id] = ev.take; renderCell(ev.take.turn); renderMap(); }
   };
 }
 

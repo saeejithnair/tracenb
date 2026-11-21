@@ -14,12 +14,13 @@ from __future__ import annotations
 
 import json
 import queue
+import shutil
 import threading
 import time
 import uuid
 from pathlib import Path
 
-from .model import LIVE, RECORDED, Node, NotCached, Session, TraceError, load
+from .model import LIVE, RECORDED, Node, NotCached, Session, TraceError, cached_only, load
 from .runtimes import build_prompt
 from .tools import is_native, same_result
 from .trace import Step
@@ -109,6 +110,10 @@ class Notebook:
 
     # ------------------------------------------------------------ the timeline
     def timeline(self) -> dict[int, str | None]:
+        with self.lock:
+            return self._timeline()
+
+    def _timeline(self) -> dict[int, str | None]:
         path, prev = {}, None
         for t in self.T.turns():
             cands = [k for k, tk in self.takes.items() if tk.turn == t and tk.parent == prev]
@@ -141,7 +146,7 @@ class Notebook:
                 raise TraceError("that take is still running")
             if "sample" not in op:  # asking for the same thing again means: draw another sample
                 sig = _signature(op, self.timeline())
-                op["sample"] = sum(1 for o in self.ops if _signature(o, None) == sig)
+                op["sample"] = max((o.get("sample", 0) + 1 for o in self.ops if _signature(o, None) == sig), default=0)
             tk = self._apply(op, replay=False)
             self.ops.append(op)
             self.selected[tk.turn] = tk.id
@@ -180,7 +185,7 @@ class Notebook:
         tk.nodes = [user]
         self.takes[tk.id] = tk
         self._launch(tk, replay, lambda cb: user.resume(op["runtime"], sample=op.get("sample", 0), on_step=cb,
-                                                         cancel=tk.cancel, cached_only=replay))
+                                                         cancel=tk.cancel))
         return tk
 
     def _op_surgery(self, op, replay):
@@ -211,8 +216,7 @@ class Notebook:
         def work(cb):
             node.step  # execute the edited call for real (cached after the first time)
             if op.get("continue"):
-                return node.resume(op["continue"], sample=op.get("sample", 0), on_step=cb, cancel=tk.cancel,
-                                   cached_only=replay)
+                return node.resume(op["continue"], sample=op.get("sample", 0), on_step=cb, cancel=tk.cancel)
             return None
         self._launch(tk, replay, work)
         return tk
@@ -228,7 +232,7 @@ class Notebook:
         tk.prefix = i - 1
         self.takes[tk.id] = tk
         self._launch(tk, replay, lambda cb: start.resume(op["runtime"], sample=op.get("sample", 0), on_step=cb,
-                                                          cancel=tk.cancel, cached_only=replay))
+                                                          cancel=tk.cancel))
         return tk
 
     def _op_replay(self, op, replay):
@@ -268,9 +272,10 @@ class Notebook:
                     tk.error = tk.run.error
             tk.live = []
 
-        if replay:
+        if replay:  # restoring: everything comes from the cache, nothing is computed
             try:
-                finish(work(None))
+                with cached_only():
+                    finish(work(None))
                 tk.status = "done"
             except NotCached:
                 tk.status, tk.error = "interrupted", "this run never finished (or its cache was cleared) — run it again"
@@ -286,7 +291,8 @@ class Notebook:
                 tk.status = "done"
             except Exception as e:
                 tk.status, tk.error = "error", f"{type(e).__name__}: {e}"
-            self.emit()
+            finally:
+                self.emit()
 
         tk.status = "running"
         threading.Thread(target=go, daemon=True).start()
@@ -320,12 +326,18 @@ class Notebook:
                         doomed.add(k)
                         changed = True
             for k in doomed:
-                self.takes[k].cancel.set()
-                del self.takes[k]
+                gone = self.takes.pop(k)
+                gone.cancel.set()
+                if gone.run_key and gone.status != "running":  # deleting discards the result: asking again re-runs
+                    for f in (CACHE / "runs").glob(f"{gone.run_key}.*"):
+                        f.unlink(missing_ok=True)
+                    shutil.rmtree(CACHE / "worlds" / f"run-{gone.run_key}", ignore_errors=True)
             self.ops = [o for o in self.ops if o["id"] not in doomed]
-            for t, k in list(self.selected.items()):
-                if k in doomed:
-                    self.selected[t] = f"o{t}"
+            for t in sorted(self.selected):
+                if self.selected[t] in doomed:
+                    above = self._timeline().get(t - 1) if t > 1 else None
+                    sibs = [k for k, x in self.takes.items() if x.turn == t and x.parent == above]
+                    self.selected[t] = max(sibs, key=lambda k: self.takes[k].created) if sibs else f"o{t}"
             self._save()
         self.emit()
 
@@ -362,9 +374,16 @@ class Notebook:
         return "\n".join(f"• {n}" for n in start.world().fidelity()) or "(no notes)"
 
     def full_output(self, take_id: str, i: int) -> str:
-        return self.takes[take_id].nodes[i].step.output or ""
+        nodes = self.takes[take_id].nodes
+        if not 0 < i < len(nodes) or not _ready(nodes[i]):
+            raise TraceError("that step isn't finished yet")
+        return nodes[i].step.output or ""
 
     def state(self) -> dict:
+        with self.lock:
+            return self._state()
+
+    def _state(self) -> dict:
         T = self.T
         spent = sum((tk.run.cost_usd or 0) for tk in self.takes.values() if tk.run)
         return {
@@ -379,7 +398,7 @@ class Notebook:
     def take_json(self, tk: Take) -> dict:
         steps = []
         if tk.status == "running":
-            fixed = [_node_json(n, i) for i, n in enumerate(tk.nodes[1:], start=1) if _ready(n)]
+            fixed = [_node_json(n, i) for i, n in enumerate(tk.nodes[1:], start=1)]
             steps = fixed + [_step_json(s, len(tk.nodes) + j, "live") for j, s in enumerate(tk.live)]
         else:
             steps = [_node_json(n, i) for i, n in enumerate(tk.nodes[1:], start=1)]
