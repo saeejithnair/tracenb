@@ -20,23 +20,32 @@ TYPES = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=u
 _titles: dict[tuple, dict] = {}
 
 
-def peek(path: str) -> dict:
-    """Title, project and size of a trace without parsing all of it."""
+def peek(path: str, budget: int = 6_000_000) -> dict:
+    """Title, project and turn count of a trace, reading at most `budget` bytes of it."""
     p = Path(path)
     key = (path, p.stat().st_mtime)
     if key in _titles:
         return _titles[key]
     title = first = cwd = ""
-    turns = 0
+    turns, read, partial = 0, 0, False
     with open(path, errors="replace") as f:
-        for n, line in enumerate(f):
+        for line in f:
+            read += len(line)
+            if read > budget:
+                partial = True
+                break
             if '"ai-title"' in line and not title:
                 m = re.search(r'"aiTitle":\s*"((?:[^"\\]|\\.)*)"', line)
                 title = json.loads(f'"{m.group(1)}"') if m else title
             if not cwd:
                 m = re.search(r'"cwd":\s*"((?:[^"\\]|\\.)*)"', line)
                 cwd = m.group(1) if m else ""
-            if '"promptSource":"typed"' in line or ('"role":"user"' in line and '"input_text"' in line and "environment_context" not in line and "AGENTS.md" not in line):
+            # a turn = a user message typed as text (same rule as the importers, approximately)
+            claude_turn = '"message":{"role":"user","content":"' in line and '"isMeta":true' not in line \
+                and '"isSidechain":true' not in line and "<task-notification" not in line
+            codex_turn = '"role":"user"' in line and '"input_text"' in line and "environment_context" not in line \
+                and "AGENTS.md" not in line and "<permissions" not in line
+            if claude_turn or codex_turn:
                 turns += 1
                 if not first:
                     try:
@@ -44,13 +53,11 @@ def peek(path: str) -> dict:
                         c = (d.get("message") or d.get("payload") or {}).get("content")
                         if isinstance(c, list):
                             c = " ".join(b.get("text", "") for b in c if isinstance(b, dict))
-                        first = (c or "").strip()
+                        first = re.sub(r"</?pasted_content[^>]*>", "", c or "").strip()
                     except Exception:
                         pass
-            if n > 20000 and title and first:
-                break
     info = {"title": title or (first.splitlines()[0][:90] if first else p.stem), "first": first[:300],
-            "cwd": cwd, "turns": turns}
+            "cwd": cwd, "turns": turns, "partial": partial}
     _titles[key] = info
     return info
 
@@ -105,6 +112,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(200, {"text": nb.prompt_for(q["take"])})
                 if sub == "/diff":
                     return self._send(200, {"text": nb.diff(q["take"])})
+                if sub == "/world":
+                    return self._send(200, {"text": nb.world_notes(q["take"])})
                 if sub == "/output":
                     return self._send(200, {"text": nb.full_output(q["take"], int(q["i"]))})
             self._send(404, {"error": "not found"})
@@ -125,7 +134,7 @@ class Handler(BaseHTTPRequestHandler):
             if not m:
                 return self._send(404, {"error": "not found"})
             nb, action = kernel.get(m.group(1)), m.group(2)
-            if action in ("run", "surgery", "fork"):
+            if action in ("run", "surgery", "fork", "replay"):
                 tk = nb.submit({**b, "op": action})
                 return self._send(200, {"take": tk.id})
             if action == "select":

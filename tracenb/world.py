@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import ctypes
 import json
+import hashlib
 import os
+import re
 import shutil
 import subprocess
 import uuid
@@ -74,6 +76,7 @@ class World:
         # The session-start world this one descends from: the baseline for diffs. Worlds are
         # copy-on-write clones, so the base is simply another directory with the same layout.
         self.base = Path(base) if base else self.root
+        self.stats: dict[str, int] = {}  # how faithfully this world was rebuilt (see Node.world)
 
     # ---- persistence
     @staticmethod
@@ -81,12 +84,14 @@ class World:
         meta = json.loads((Path(root) / ".tracenb.json").read_text())
         # mounts are stored relative to root so cloned worlds stay valid
         mounts = {k: str(Path(root) / v) for k, v in meta["mounts"].items()}
-        return World(root, mounts, meta["home"], meta.get("notes", []), meta.get("base"))
+        w = World(root, mounts, meta["home"], meta.get("notes", []), meta.get("base"))
+        w.stats = meta.get("stats", {})
+        return w
 
     def _save(self):
         rel = {k: str(Path(v).relative_to(self.root)) for k, v in self.mounts.items()}
         (self.root / ".tracenb.json").write_text(json.dumps({"mounts": rel, "home": self.home, "notes": self.notes,
-                                                             "base": str(self.base)}, indent=1))
+                                                             "base": str(self.base), "stats": self.stats}, indent=1))
 
     def fork(self, key: str) -> "World":
         """A private mutable copy of this world."""
@@ -97,39 +102,40 @@ class World:
         return World.open(dst)
 
     # ---- relocation
-    def _pairs(self, reverse=False):
-        pairs = []
+    def _table(self, reverse: bool) -> dict[str, str]:
+        t2w = {}
         for t, w in self.mounts.items():
-            pairs.append((t, w))
+            t2w[t] = w
             if t.startswith(HOME + "/"):
-                pairs.append(("~" + t[len(HOME):], w))
-        pairs.sort(key=lambda p: -len(p[0]))
-        return [(w, t) for t, w in pairs if not t.startswith("~")] if reverse else pairs
+                t2w["~" + t[len(HOME):]] = w
+        if not reverse:
+            return t2w
+        w2t = {}
+        for t, w in self.mounts.items():
+            # macOS: /tmp and /var are symlinks into /private; tools may print either spelling
+            for form in {w, os.path.realpath(w)}:
+                w2t[form] = t
+                if form.startswith("/private/"):
+                    w2t[form[len("/private"):]] = t
+        return w2t
+
+    def _sub(self, s, reverse: bool):
+        if isinstance(s, str):
+            table = self._table(reverse)
+            # one pass, longest key first, so replaced text is never rescanned
+            pat = re.compile("|".join(re.escape(k) for k in sorted(table, key=len, reverse=True)))
+            return pat.sub(lambda m: table[m.group(0)], s)
+        if isinstance(s, dict):
+            return {k: self._sub(v, reverse) for k, v in s.items()}
+        if isinstance(s, list):
+            return [self._sub(v, reverse) for v in s]
+        return s
 
     def to_world(self, s):
-        if isinstance(s, str):
-            for t, w in self._pairs():
-                s = s.replace(t, w)
-            return s
-        if isinstance(s, dict):
-            return {k: self.to_world(v) for k, v in s.items()}
-        if isinstance(s, list):
-            return [self.to_world(v) for v in s]
-        return s
+        return self._sub(s, reverse=False)
 
     def from_world(self, s):
-        if isinstance(s, str):
-            for w, t in self._pairs(reverse=True):
-                s = s.replace(w, t)
-                # macOS: /tmp and /var are symlinks into /private; tools may print either form
-                if w.startswith("/private/"):
-                    s = s.replace(w[len("/private"):], t)
-            return s
-        if isinstance(s, dict):
-            return {k: self.from_world(v) for k, v in s.items()}
-        if isinstance(s, list):
-            return [self.from_world(v) for v in s]
-        return s
+        return self._sub(s, reverse=True)
 
     # ---- inspection
     def _pairs_with_base(self):
@@ -178,11 +184,24 @@ class World:
         return "\n".join(out)
 
     # ---- sandboxing
-    def sandbox_profile(self, extra_writable: list[str] = ()) -> str:
+    def fidelity(self) -> list[str]:
+        """Human-readable notes on how well this world reproduces the original."""
+        out = list(self.notes)
+        s = self.stats
+        if s.get("shell_rerun"):
+            out.append(f"re-ran {s['shell_rerun']} of the session's shell command(s) offline to rebuild the files; "
+                       f"{s.get('shell_same', 0)} reproduced their recorded output exactly")
+        if s.get("edit_rerun"):
+            out.append(f"re-applied {s['edit_rerun']} file edit(s); {s.get('edit_same', 0)} applied as recorded")
+        return out
+
+    def sandbox_profile(self, extra_writable: list[str] = (), offline: bool = False) -> str:
         writable = [str(self.root), "/private/tmp", "/private/var/folders", "/dev", *extra_writable]
         rules = " ".join(f'(subpath "{p}")' for p in writable)
         prof = f'(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write* {rules} (regex #"^{HOME}/\\.claude\\.json"))\n'
-        p = self.root.parent / f"{self.root.name}.sb"
+        if offline:  # rebuilding/replaying must never reach the outside world again
+            prof += '(deny network-outbound (remote ip))\n'
+        p = self.root.parent / f"{self.root.name}{'.offline' if offline else ''}.sb"
         p.write_text(prof)
         return str(p)
 
@@ -190,7 +209,7 @@ class World:
 # ---------------------------------------------------------------- base world
 def base_world(trace) -> World:
     """The trace's mount points as they were when the session started (best reconstruction)."""
-    root = CACHE / "worlds" / f"base-{trace.id}"
+    root = CACHE / "worlds" / f"base-{trace.id}-{hashlib.sha256(trace.source.encode()).hexdigest()[:8]}"
     if (root / ".tracenb.json").exists():
         return World.open(root)
     tmp = root.with_name(scratch_name(root.name))
@@ -256,7 +275,7 @@ def _same_file(a: Path, b: Path) -> bool:
     sa, sb = a.stat(), b.stat()
     if sa.st_size != sb.st_size:
         return False
-    if int(sa.st_mtime) == int(sb.st_mtime):
+    if sa.st_mtime_ns == sb.st_mtime_ns:  # clones keep exact mtimes; any write changes it
         return True
     import filecmp
     return filecmp.cmp(a, b, shallow=False)

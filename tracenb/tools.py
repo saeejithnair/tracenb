@@ -17,6 +17,7 @@ from __future__ import annotations
 import glob as _glob
 import json
 import os
+import re
 import shlex
 import subprocess
 from pathlib import Path
@@ -44,17 +45,30 @@ def _shell_cmd(step: Step) -> tuple[str, str | None]:
     return cmd, inp.get("workdir")
 
 
-def run_shell(cmd: str, world: World, workdir: str | None = None, timeout_s: float = 120) -> tuple[str, bool]:
-    cwd = world.to_world(workdir) if workdir else world.to_world(world.home)
-    prof = world.sandbox_profile()
+def run_shell(cmd: str, world: World, workdir: str | None = None, timeout_s: float = 120,
+              harness: str = "claude-code", offline: bool = False) -> tuple[str, bool]:
+    home = world.to_world(world.home)
+    cwd = world.to_world(workdir) if workdir else home
+    prof = world.sandbox_profile(offline=offline)
+    marker = world.root / ".shell-pwd"
+    # run the command, then note where the shell ended up (Claude Code resets it if it left the project)
+    wrapped = f"{world.to_world(cmd)}\n__tnb_rc=$?; pwd -P > {shlex.quote(str(marker))} 2>/dev/null; exit $__tnb_rc"
     try:
-        r = subprocess.run(["sandbox-exec", "-f", prof, "/bin/zsh", "-c", world.to_world(cmd)], cwd=cwd,
+        r = subprocess.run(["sandbox-exec", "-f", prof, "/bin/zsh", "-c", wrapped], cwd=cwd,
                            capture_output=True, text=True, timeout=timeout_s, errors="replace")
     except subprocess.TimeoutExpired:
         return f"Command timed out after {timeout_s:.0f}s", True
     out = (r.stdout + ("\n" if r.stdout and r.stderr else "") + r.stderr).rstrip("\n")
     if r.returncode:
         out = f"Exit code {r.returncode}\n{out}"
+    if harness == "claude-code":
+        try:
+            end = marker.read_text().strip()
+        except OSError:
+            end = ""
+        real_home = os.path.realpath(home)
+        if end and not (end == real_home or end.startswith(real_home + "/")):
+            out += f"\nShell cwd was reset to {world.home}"
     return world.from_world(_clip(out)), r.returncode != 0
 
 
@@ -70,7 +84,7 @@ def _read(inp, world):
     lines = data.decode(errors="replace").splitlines()
     off = max(int(inp.get("offset") or 1), 1)
     lim = int(inp.get("limit") or 2000)
-    out = "\n".join(f"{i:>6}\t{l[:2000]}" for i, l in enumerate(lines[off - 1: off - 1 + lim], start=off))
+    out = "\n".join(f"{i}\t{l[:2000]}" for i, l in enumerate(lines[off - 1: off - 1 + lim], start=off))
     return out or "<system-reminder>Warning: the file exists but the contents are empty.</system-reminder>", False
 
 
@@ -246,13 +260,14 @@ def _oracle(step: Step, world: World, harness: str) -> tuple[str, bool]:
 
 
 # ---------------------------------------------------------------- entry points
-def execute(step: Step, world: World, harness: str) -> Step:
-    """Run `step`'s action in `world` (mutating it). Returns the step with its observation."""
+def execute(step: Step, world: World, harness: str, offline: bool = False) -> Step:
+    """Run `step`'s action in `world` (mutating it). Returns the step with its observation.
+    offline: no network (used when re-running the session's own commands to rebuild a world)."""
     try:
         if step.tool in SHELLS:
             cmd, wd = _shell_cmd(step)
             t = float(step.input.get("timeout") or 120000) / 1000 if step.tool == "Bash" else 120
-            out, err = run_shell(cmd, world, wd, timeout_s=min(t, 600))
+            out, err = run_shell(cmd, world, wd, timeout_s=min(t, 600), harness=harness, offline=offline)
             via = "native"
         elif step.tool == "apply_patch":
             out, err = apply_patch(step.input.get("input") or step.input.get("patch", ""), world)
@@ -260,6 +275,8 @@ def execute(step: Step, world: World, harness: str) -> Step:
         elif step.tool in NATIVE:
             out, err = NATIVE[step.tool](step.input, world)
             via = "native"
+        elif offline:
+            return step.with_(output="(not re-run: needs a model)", error=False, meta={**step.meta, "via": "kept"})
         else:
             out, err = _oracle(step, world, harness)
             via = "oracle"
@@ -268,10 +285,33 @@ def execute(step: Step, world: World, harness: str) -> Step:
     return step.with_(output=out, error=err, meta={**step.meta, "via": via})
 
 
-def replay_effect(step: Step, world: World) -> str | None:
-    """Re-apply a recorded call's file effect. Returns a note if it didn't apply cleanly."""
-    if step.tool == "apply_patch":
-        _, err = apply_patch(step.input.get("input") or step.input.get("patch", ""), world)
-    else:
-        _, err = NATIVE[step.tool](step.input, world)
-    return f"replaying {step.id} ({step.tool}) did not apply cleanly" if err else None
+# ---------------------------------------------------------------- comparing observations
+_REMINDER = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
+
+
+_HINT = re.compile(r" \(file state is current in your context[^)]*\)")
+
+
+def _norm(s: str) -> str:
+    s = _HINT.sub("", _REMINDER.sub("", s or ""))
+    lines = [l.rstrip() for l in s.splitlines() if not l.startswith("Shell cwd was reset to ")]
+    return "\n".join(lines).strip()
+
+
+def same_observation(recorded: str | None, new: str | None) -> bool:
+    """Did the world answer the same way? Ignores harness packaging: reminders, cwd-reset notes,
+    and Claude Code's persisted-output wrapper (compared through its preview)."""
+    a, b = _norm(recorded), _norm(new)
+    if a.startswith("<persisted-output>"):
+        preview = a.split("Preview (first", 1)[-1].split("\n", 1)[-1] if "Preview (first" in a else ""
+        preview = preview.removesuffix("...").removesuffix("</persisted-output>").strip()
+        return bool(preview) and b.startswith(preview[: max(len(preview) - 200, 1)])
+    return a == b
+
+
+def same_result(recorded: Step, output: str | None, error: bool) -> bool:
+    """Did re-running `recorded` come out the same? For file edits, what matters is whether the edit
+    applied; their confirmation message is packaging. For everything else, compare observations."""
+    if recorded.tool in FILE_EFFECTS:
+        return bool(recorded.error) == bool(error)
+    return same_observation(recorded.output, output)

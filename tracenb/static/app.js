@@ -147,7 +147,7 @@ async function library() {
       <button class="trace-row" data-path="${esc(t.path)}">
         <div class="t">${esc(t.title)}</div>
         <div class="m"><span class="chip"><span class="dot" style="background:${t.harness === "codex" ? "var(--c-codex)" : "var(--c-claude)"}"></span>${esc(t.harness)}</span>
-          <span>${esc(short(t.cwd) || "")}</span><span>${t.turns} turns</span><span>${esc(t.modified)}</span><span>${(t.size_kb / 1024).toFixed(1)} MB</span></div>
+          <span>${esc(short(t.cwd) || "")}</span><span>${t.turns}${t.partial ? "+" : ""} turns</span><span>${esc(t.modified)}</span><span>${(t.size_kb / 1024).toFixed(1)} MB</span></div>
         ${t.first && t.first !== t.title ? `<div class="f">${esc(t.first)}</div>` : ""}
       </button>`).join("") || `<div class="empty">No sessions match.</div>`;
   };
@@ -297,7 +297,8 @@ function cellHTML(t) {
   // input
   h += `<div class="input"><div class="input-hd"><span class="who">${sys ? "System event" : "You"}</span>${edited ? `<span class="chip" style="color:var(--acc)">edited</span>` : ""}
         <span class="sp"></span>${rtSelect(`cell-${t}`, cellRt(t))}
-        <button class="btn primary sm" data-act="run" data-turn="${t}" ${prevOk ? "" : "disabled title='Run the cell above first'"}>▶ Run</button></div>`;
+        <button class="btn primary sm" data-act="run" data-turn="${t}" ${prevOk ? "" : "disabled title='Run the cell above first'"}>▶ Run</button>
+        <button class="btn sm" data-act="run-all" data-turn="${t}" ${prevOk ? "" : "disabled"} title="Run this turn with every model, side by side">▶ every model</button></div>`;
   if (editing) {
     const v = ui.drafts[pk] ?? prompt;
     h += `<textarea class="ed" data-key="${pk}" rows="${Math.min(14, Math.max(3, v.split("\n").length + 1))}">${esc(v)}</textarea>
@@ -378,11 +379,13 @@ function stepHTML(tk, st, readonly) {
   const key = `${tk.id}:${st.i}`;
   const open = ui.open.has(key) || !!ui.editors[key];
   const isEdited = tk.edited != null && st.i - 1 === tk.edited;
-  const isNew = st.state === "live" && !isEdited && (tk.kind !== "original") && (st.i - 1 >= tk.prefix);
+  const isNew = st.state === "live" && !isEdited && !["original", "replay"].includes(tk.kind) && (st.i - 1 >= tk.prefix);
   const rtc = st.via && st.via.includes(":") || st.via === "codex" ? rtColor(st.via) : (tk.runtime ? rtColor(tk.runtime) : "var(--acc)");
   const cls = ["step", open ? "open" : "", st.kind === "tool" && st.error ? "err" : "", isEdited ? "edited" : "", isNew ? "new" : "",
     st.kind === "think" ? "thinking" : "", st.state === "live" && st.kind === "tool" && st.output == null ? "live-pending" : ""].join(" ");
   let meta = "";
+  if (tk.kind === "replay" && st.kind === "tool" && st.via === "kept") meta += `<span class="chip">kept as recorded (needs a model)</span>`;
+  else if (tk.kind === "replay" && st.kind === "tool" && st.orig) meta += st.orig.same_output ? `<span class="chip" style="color:var(--ok)">✓ same result</span>` : `<span class="chip" style="color:var(--warn)">≠ different result</span>`;
   if (isEdited) meta += `<span class="badge">${st.via === "forced" ? "faked result" : st.kind === "tool" ? "edited · ran for real" : "edited"}</span>`;
   else if (st.via === "oracle") meta += `<span class="chip">via oracle</span>`;
   if (st.state === "executing") meta += `<span class="spin"></span>running…`;
@@ -484,7 +487,14 @@ function footHTML(tk, readonly) {
   if (tk.status === "running") {
     right = `<span class="spin"></span><span>${esc(rtLabel(tk.runtime))} is working…</span><button class="btn sm" data-act="stop" data-take="${tk.id}">■ Stop</button>`;
   } else if (!readonly) {
+    if (tk.kind === "replay") {
+      const cmp = tk.steps.filter((s) => s.kind === "tool" && s.orig && s.via !== "kept");
+      const same = cmp.filter((s) => s.orig.same_output).length;
+      parts.push(`<span>world fidelity <b style="color:${same === cmp.length ? "var(--ok)" : "var(--warn)"}">${same}/${cmp.length}</b> results identical</span>`);
+    }
+    if (tk.steps.some((s) => s.kind === "tool") && tk.kind !== "replay") right += `<a data-act="replay" data-take="${tk.id}" title="Re-execute these exact calls in the reconstructed world and see which results come out the same">⟲ replay calls</a>`;
     if (tk.kind !== "original") right += `<a data-act="diff" data-take="${tk.id}">files changed</a>`;
+    if (tk.kind !== "original") right += `<a data-act="world" data-take="${tk.id}" title="How faithfully the files were reconstructed for this take">world fidelity</a>`;
     if (tk.runtime) right += `<a data-act="prompt" data-take="${tk.id}">what the model saw</a>`;
   }
   return `<div class="foot">${parts.join("")}<span class="sp"></span>${right}</div>`;
@@ -544,18 +554,24 @@ document.addEventListener("click", async (e) => {
   if (!a || !S && !["keys"].includes(a.dataset.act)) return;
   const d = a.dataset, t = +d.turn;
   const cellEl = a.closest(".cell");
-  if (cellEl) setFocus(+cellEl.dataset.turn, false);
+  const ct = cellEl ? +cellEl.dataset.turn : null;  // the clicked cell (its DOM may be replaced below)
+  if (ct) { ui.focus = ct; document.querySelectorAll(".cell.focused").forEach((c) => c.classList.remove("focused")); cellEl.classList.add("focused"); }
+  const rerender = () => { if (ct) { ui.sigs[ct] = null; renderCell(ct); } };
   switch (d.act) {
     case "keys": $("#keys").hidden = !$("#keys").hidden; break;
     case "toggle": {
       if (window.getSelection().toString()) break;  // let people select text
       ui.open.has(d.key) ? ui.open.delete(d.key) : ui.open.add(d.key);
-      rerender(a); break;
+      rerender(); break;
     }
-    case "edit-prompt": if (window.getSelection().toString()) break; ui.editingPrompt[t] = true; rerender(a); focusEditor(`prompt-${t}`); break;
-    case "cancel-prompt": ui.editingPrompt[t] = false; delete ui.drafts[`prompt-${t}`]; rerender(a); break;
-    case "reset-prompt": ui.drafts[`prompt-${t}`] = S.turns.find((x) => x.turn === t).prompt; rerender(a); break;
+    case "edit-prompt": if (window.getSelection().toString()) break; ui.editingPrompt[t] = true; rerender(); focusEditor(`prompt-${t}`); break;
+    case "cancel-prompt": ui.editingPrompt[t] = false; delete ui.drafts[`prompt-${t}`]; rerender(); break;
+    case "reset-prompt": ui.drafts[`prompt-${t}`] = S.turns.find((x) => x.turn === t).prompt; rerender(); break;
     case "run": runCell(t); break;
+    case "run-all": {
+      for (const r of S.runtimes) await runCell(t, r.id, true);
+      ui.compare.add(t); rerender(); toast(`Running turn ${t} with ${S.runtimes.length} models`); break;
+    }
     case "run-below": {
       await act(() => api.post(`/api/nb/${S.id}/run_below`, { turn: t, runtime: cellRt(t) }));
       toast(`Running turn ${t} and below with ${rtLabel(cellRt(t))}`); break;
@@ -569,17 +585,17 @@ document.addEventListener("click", async (e) => {
     case "map-turn": scrollToCell(t); break;
     case "del-take": {
       e.stopPropagation();
-      if (ui.confirmDel !== d.take) { ui.confirmDel = d.take; rerender(a); setTimeout(() => { ui.confirmDel = null; }, 3000); break; }
+      if (ui.confirmDel !== d.take) { ui.confirmDel = d.take; rerender(); setTimeout(() => { ui.confirmDel = null; }, 3000); break; }
       ui.confirmDel = null;
       await act(() => api.post(`/api/nb/${S.id}/delete`, { take: d.take })); break;
     }
-    case "compare": ui.compare.has(t) ? ui.compare.delete(t) : ui.compare.add(t); rerender(a); break;
+    case "compare": ui.compare.has(t) ? ui.compare.delete(t) : ui.compare.add(t); rerender(); break;
     case "ed": {
       const key = `${d.take}:${d.i}`;
-      ui.editors[key] = { mode: d.mode }; ui.open.add(key); rerender(a);
+      ui.editors[key] = { mode: d.mode }; ui.open.add(key); rerender();
       if (d.mode !== "fork") focusEditor(`${key}:${d.mode}`); break;
     }
-    case "close-ed": delete ui.editors[d.key]; rerender(a); break;
+    case "close-ed": delete ui.editors[d.key]; rerender(); break;
     case "do-fork": {
       const key = `${d.take}:${d.i}`;
       const runtime = ui.rt[`ed-${key}`] || ui.defaultRt;
@@ -589,6 +605,10 @@ document.addEventListener("click", async (e) => {
     }
     case "do-surgery": doSurgery(d); break;
     case "stop": await act(() => api.post(`/api/nb/${S.id}/stop`, { take: d.take })); break;
+    case "replay": {
+      const r = await act(() => api.post(`/api/nb/${S.id}/replay`, { take: d.take }));
+      if (r) toast("Re-executing the recorded calls in the reconstructed world…"); break;
+    }
     case "full": {
       const r = await act(() => api.get(`/api/nb/${S.id}/output?take=${d.take}&i=${d.i}`));
       if (r) modal("Full result", r.text); break;
@@ -596,6 +616,10 @@ document.addEventListener("click", async (e) => {
     case "diff": {
       const r = await act(() => api.get(`/api/nb/${S.id}/diff?take=${d.take}`));
       if (r) modal("Files changed on this timeline (vs. the start of the session)", r.text); break;
+    }
+    case "world": {
+      const r = await act(() => api.get(`/api/nb/${S.id}/world?take=${d.take}`));
+      if (r) modal("The world this take ran in", r.text); break;
     }
     case "prompt": {
       const r = await act(() => api.get(`/api/nb/${S.id}/prompt?take=${d.take}`));
@@ -614,7 +638,6 @@ document.addEventListener("change", (e) => {
 });
 document.addEventListener("input", (e) => { if (e.target.dataset.key) ui.drafts[e.target.dataset.key] = e.target.value; });
 
-function rerender(el) { const c = el.closest(".cell"); if (c) { ui.sigs[+c.dataset.turn] = null; renderCell(+c.dataset.turn); } }
 function focusEditor(key) { setTimeout(() => { const el = document.querySelector(`[data-key="${CSS.escape(key)}"]`); if (el) { el.focus(); el.setSelectionRange(el.value.length, el.value.length); } }, 0); }
 function scrollToCell(t) { const el = document.getElementById(`cell-${t}`); if (el) { el.scrollIntoView({ behavior: "smooth", block: "start" }); setFocus(t, false); } }
 function setFocus(t, scroll = true) {
@@ -624,13 +647,14 @@ function setFocus(t, scroll = true) {
   if (scroll) document.getElementById(`cell-${t}`)?.scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
 
-async function runCell(t) {
+async function runCell(t, rtOverride, quiet) {
   const turn = S.turns.find((x) => x.turn === t);
   const tk = S.timeline[t] && S.takes[S.timeline[t]];
   const prompt = ui.editingPrompt[t] ? (ui.drafts[`prompt-${t}`] ?? (tk ? tk.prompt : turn.prompt)) : (tk ? tk.prompt : turn.prompt);
-  const runtime = cellRt(t);
+  const runtime = rtOverride || cellRt(t);
   const r = await act(() => api.post(`/api/nb/${S.id}/run`, { turn: t, prompt, runtime }));
-  if (r) { ui.editingPrompt[t] = false; delete ui.drafts[`prompt-${t}`]; toast(`Running turn ${t} with ${rtLabel(runtime)}`); }
+  if (r && !rtOverride) { ui.editingPrompt[t] = false; delete ui.drafts[`prompt-${t}`]; }
+  if (r && !quiet) toast(`Running turn ${t} with ${rtLabel(runtime)}`);
 }
 
 async function doSurgery(d) {

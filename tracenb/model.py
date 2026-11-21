@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 
 from .runtimes import Run, build_prompt, get_runtime
-from .tools import SHELLS, execute, replay_effect, replayable
+from .tools import SHELLS, execute, is_native, replayable, same_result
 from .trace import Step, Trace, load as load_trace
 from .world import CACHE, World, base_world, publish, scratch_name
 
@@ -69,13 +69,13 @@ class Node:
         self.run, self.branch = run, None
         self._lock = threading.Lock()
         if parent is None:
-            self.key, self.label, self.turn = _h("root", S.trace.id), "start", 0
+            self.key, self.label, self.turn = _h("root", S.trace.id, S.trace.source), "start", 0
             return
         if state == RECORDED:
             self.key = _h(parent.key, "rec", step.id)
             self.label = step.id
         else:
-            out = step.output if step.meta.get("via") == "forced" else ""
+            out = step.output if step.meta.get("via") in ("forced", "replayed", "kept") else ""
             self.key = _h(parent.key, state, *step.action(), out, salt)
             self.label = label or (f"{self.rec.id}′" if self.rec is not None and self.rec.id else f"{parent.label}+")
         if turn is not None:
@@ -89,7 +89,7 @@ class Node:
     def _child(self, step: Step, rec: Step | None = None, salt: str = "") -> "Node":
         """A new cell after this one. If it is exactly what the trace did next, it *is* the recorded step."""
         S = self.S
-        if self.state == RECORDED and not salt and step.meta.get("via") != "forced":
+        if self.state == RECORDED and not salt and step.output is None:
             nid = S.next_id(self.label if self.parent else None)
             if nid is not None and S.trace[nid].action() == step.action():
                 return S.at(nid)
@@ -111,9 +111,10 @@ class Node:
     def bash(self, command: str, **kw) -> "Node":
         return self.tool("Bash", {"command": command, **kw})
 
-    def observe(self, step: Step, output: str, error: bool = False, rec: Step | None = None) -> "Node":
-        """A tool call whose observation is forced, not executed: 'what if it had returned this?'"""
-        st = step.with_(output=output, error=error, meta={"via": "forced"})
+    def observe(self, step: Step, output: str, error: bool = False, rec: Step | None = None,
+                via: str = "forced") -> "Node":
+        """A tool call whose observation is given rather than executed: 'what if it had returned this?'"""
+        st = step.with_(output=output, error=error, meta={"via": via})
         return self._child(st, rec)
 
     # ------------------------------------------------------------ the step (lazy execution)
@@ -146,7 +147,7 @@ class Node:
 
     @property
     def executed(self) -> bool:
-        return self.state == LIVE and self.kind == "tool" and self._step.meta.get("via") not in ("forced",) \
+        return self.state == LIVE and self.kind == "tool" and self._step.meta.get("via") not in ("forced", "replayed", "kept") \
             and self.run is None
 
     # ------------------------------------------------------------ paths and worlds
@@ -170,32 +171,67 @@ class Node:
             return CACHE / "worlds" / f"run-{self.branch['key']}"
         return None
 
+    def _effectful(self) -> bool:
+        """Does this step change files in a way we can reproduce by re-running it?"""
+        if self.parent is None or self.kind != "tool" or self.executed or self.branch is not None:
+            return False
+        st = self._step if self._step is not None else self.rec
+        if st.meta.get("via") in ("forced", "replayed", "kept"):
+            return False
+        if st.tool in SHELLS:
+            return not st.input.get("run_in_background")
+        return replayable(st)
+
     def world(self) -> World:
-        """The files as they stood right after this node (do not mutate; .fork() first)."""
+        """The files as they stood right after this node (do not mutate; .fork() first).
+
+        Built incrementally: the nearest ancestor whose world is known, then every file-changing
+        step since — file edits re-applied exactly, shell commands re-run *offline* in the sandbox.
+        Each such world is cached, and each re-run is kept so replays can show it."""
         chain, n = [], self
-        while n.parent is not None and n._snapshot() is None:
+        while True:
+            if n.parent is None:
+                w = base_world(self.S.trace)
+                break
+            snap = n._snapshot() or (CACHE / "worlds" / f"at-{n.key}" if n._effectful() else None)
+            if snap is not None and (snap / ".tracenb.json").exists():
+                w = World.open(snap)
+                break
             chain.append(n)
             n = n.parent
-        base = base_world(self.S.trace) if n.parent is None else World.open(n._snapshot())
-        chain.reverse()
-        effects = [m.step for m in chain if replayable(m.step) and m.step.meta.get("via") != "forced"]
-        unreplayed = sum(1 for m in chain if m.kind == "tool" and m.step.tool in SHELLS)
-        if not effects and not unreplayed:
-            return base
-        final = CACHE / "worlds" / f"at-{self.key}"
-        if (final / ".tracenb.json").exists():
-            return World.open(final)
-        w = base.fork(scratch_name(f"at-{self.key}"))
-        for e in effects:
-            note = replay_effect(e, w)
-            if note:
-                w.notes.append(note)
-        if unreplayed:
-            w.notes.append(f"{unreplayed} recorded shell command(s) before {self.label} were not re-run; "
-                           "files they changed are not reflected")
-        w._save()
-        w = World.open(publish(w.root, final))
+        for m in reversed(chain):
+            if m._effectful():
+                w = m._rebuild_from(w)
         return w
+
+    def _rebuild_from(self, before: World) -> World:
+        final = CACHE / "worlds" / f"at-{self.key}"
+        st = self.step
+        w = before.fork(scratch_name(f"at-{self.key}"))
+        redo = execute(st.with_(output=None, error=False), w, self.S.trace.harness, offline=True)
+        same = same_result(st, redo.output, redo.error)
+        k = "shell" if st.tool in SHELLS else "edit"
+        w.stats[f"{k}_rerun"] = w.stats.get(f"{k}_rerun", 0) + 1
+        w.stats[f"{k}_same"] = w.stats.get(f"{k}_same", 0) + int(same)
+        w._save()
+        rp = CACHE / "replays" / f"{self.key}.json"
+        rp.parent.mkdir(parents=True, exist_ok=True)
+        rp.write_text(json.dumps({"output": redo.output, "error": redo.error, "same": same}))
+        return World.open(publish(w.root, final))
+
+    def rerun(self) -> dict:
+        """Re-run this recorded step, unchanged, in the world as rebuilt just before it — offline.
+        Returns {output, error, same} (same: did the world answer as it did in the trace?)."""
+        if self.kind != "tool":
+            raise TraceError("only tool calls can be re-run")
+        if self._effectful():
+            self.world()  # rebuilding the world re-runs it and keeps the result
+            return json.loads((CACHE / "replays" / f"{self.key}.json").read_text())
+        st = self.step
+        if not is_native(st):
+            return {"output": st.output, "error": st.error, "same": True, "kept": True}
+        redo = execute(st.with_(output=None, error=False), self.parent.world(), self.S.trace.harness, offline=True)
+        return {"output": redo.output, "error": redo.error, "same": same_result(st, redo.output, redo.error)}
 
     # ------------------------------------------------------------ continuing with a runtime
     def resume(self, runtime: str = "claude", budget_usd: float = 3.0, sample: int = 0,

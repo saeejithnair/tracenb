@@ -21,6 +21,7 @@ from pathlib import Path
 
 from .model import LIVE, RECORDED, Node, NotCached, Session, TraceError, load
 from .runtimes import build_prompt
+from .tools import is_native, same_result
 from .trace import Step
 from .world import CACHE
 
@@ -135,6 +136,12 @@ class Notebook:
     def submit(self, op: dict) -> Take:
         op = {**op, "id": op.get("id") or uuid.uuid4().hex[:8], "at": time.time()}
         with self.lock:
+            base = self.takes.get(op.get("take", ""))
+            if base is not None and base.status == "running":
+                raise TraceError("that take is still running")
+            if "sample" not in op:  # asking for the same thing again means: draw another sample
+                sig = _signature(op, self.timeline())
+                op["sample"] = sum(1 for o in self.ops if _signature(o, None) == sig)
             tk = self._apply(op, replay=False)
             self.ops.append(op)
             self.selected[tk.turn] = tk.id
@@ -150,6 +157,8 @@ class Notebook:
             return self._op_surgery(op, replay)
         if kind == "fork":
             return self._op_fork(op, replay)
+        if kind == "replay":
+            return self._op_replay(op, replay)
         raise TraceError(f"unknown op {kind}")
 
     def _op_run(self, op, replay):
@@ -220,6 +229,34 @@ class Notebook:
         self.takes[tk.id] = tk
         self._launch(tk, replay, lambda cb: start.resume(op["runtime"], sample=op.get("sample", 0), on_step=cb,
                                                           cancel=tk.cancel, cached_only=replay))
+        return tk
+
+    def _op_replay(self, op, replay):
+        """Re-execute every tool call of take `take`, unchanged, in the reconstructed world, keeping
+        the agent's words as they were. Shows where the world answers differently than it did."""
+        base = self.takes[op["take"]]
+        tk = Take(op["id"], base.turn, base.parent, "replay", f"⟲ replay of {base.label}", op)
+        tk.runtime = None
+        tk.nodes = [base.nodes[0]]
+        self.takes[tk.id] = tk
+
+        def work(cb):
+            prev = tk.nodes[0]
+            for n in base.nodes[1:]:
+                if tk.cancel.is_set():
+                    raise TraceError("stopped")
+                old = n.step
+                if old.kind == "tool":
+                    r = n.rerun()  # offline, in the world rebuilt up to just before this call
+                    node = prev.observe(Step("tool", tool=old.tool, input=old.input), r["output"] or "", r["error"],
+                                        rec=old, via="kept" if r.get("kept") else "replayed")
+                else:
+                    node = prev._child(Step(old.kind, text=old.text), rec=old, salt=f"replay{op['id']}")
+                tk.nodes.append(node)
+                prev = node
+                self.emit_take(tk)
+            return None
+        self._launch(tk, replay, work)
         return tk
 
     def _launch(self, tk: Take, replay: bool, work):
@@ -318,6 +355,12 @@ class Notebook:
         tk = self.takes[take_id]
         return tk.tip.world().diff() or "(no file changes relative to the start of the session)"
 
+    def world_notes(self, take_id: str) -> str:
+        """How faithful is the world this take started from?"""
+        tk = self.takes[take_id]
+        start = tk.nodes[min(tk.prefix, len(tk.nodes) - 1)]
+        return "\n".join(f"• {n}" for n in start.world().fidelity()) or "(no notes)"
+
     def full_output(self, take_id: str, i: int) -> str:
         return self.takes[take_id].nodes[i].step.output or ""
 
@@ -370,6 +413,14 @@ class Notebook:
                 pass
 
 
+def _signature(op: dict, timeline: dict | None) -> str:
+    keep = {k: v for k, v in op.items() if k not in ("id", "at", "sample")}
+    if op["op"] == "run" and "parent" not in keep and timeline is not None:
+        t = int(op["turn"])
+        keep["parent"] = timeline.get(t - 1) if t > 1 else None
+    return json.dumps(keep, sort_keys=True)
+
+
 def _ready(n: Node) -> bool:
     """Is this node's step available without blocking (i.e. not mid-execution)?"""
     return not (n.state == LIVE and n.kind == "tool" and n._step.output is None)
@@ -392,7 +443,8 @@ def _step_json(st: Step, i: int, state: str, node: Node | None = None) -> dict:
         if node.state == LIVE and rec is not None and node.run is None:
             ro, rcut = _clip(rec.output)
             d["orig"] = {"input": rec.input, "output": ro, "text": rec.text, "id": rec.id,
-                         "same_action": rec.action() == st.action()}
+                         "same_action": rec.action() == st.action(),
+                         "same_output": same_result(rec, st.output, st.error)}
     return d
 
 
