@@ -82,7 +82,7 @@ kbd { font: 11px var(--mono); border: 1px solid var(--line); border-bottom-width
   border-radius: 6px; border: 1.5px solid var(--c-orig); color: var(--ink); padding: 0 4px; background: var(--panel); }
 .cell.stale .gutter .n { border-style: dashed; border-color: var(--warn); color: var(--warn); }
 .cell.focused .card { box-shadow: 0 0 0 2px color-mix(in srgb, var(--acc) 35%, transparent); }
-.card { border: 1px solid var(--line); background: var(--panel); border-radius: var(--r); overflow: hidden; }
+.card { border: 1px solid var(--line); background: var(--panel); border-radius: var(--r); overflow: hidden; min-width: 0; }
 
 .input { padding: 10px 14px 10px; border-bottom: 1px solid var(--line); }
 .input-hd { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
