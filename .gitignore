@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+# Generated notebooks embed paths to private traces; outputs hold private content.
+notebooks/
+__marimo__/
+.pytest_cache/
