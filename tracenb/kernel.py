@@ -7,6 +7,9 @@ previous turn (its parent), so takes form a tree; the *timeline* is the path of 
 takes from turn 1 down. A cell whose selected take doesn't hang off the timeline above is
 *stale*: its context changed upstream and it hasn't been run in the new one.
 
+A *check* is not a version: it re-executes a take's recorded calls to measure how faithfully the
+world is reconstructed, and annotates that take. Checks never enter the timeline.
+
 Every take is created by an op, appended to a log. Reopening a notebook replays the log
 from cache (ops whose results aren't cached come back "interrupted", never re-run on their own).
 """
@@ -21,29 +24,12 @@ import uuid
 from pathlib import Path
 
 from .model import LIVE, RECORDED, Node, NotCached, Session, TraceError, cached_only, load
-from .runtimes import build_prompt
+from .runtimes import build_prompt, catalog, label as runtime_label
 from .tools import is_native, same_result
 from .trace import Step
 from .world import CACHE
 
 OUT_CLIP = 8000
-
-
-def runtimes_catalog() -> list[dict]:
-    codex_model = ""
-    try:
-        for line in open(Path.home() / ".codex" / "config.toml"):
-            if line.strip().startswith("model ="):
-                codex_model = line.split("=", 1)[1].strip().strip('"')
-                break
-    except OSError:
-        pass
-    return [
-        {"id": "claude:opus", "label": "Claude Opus", "family": "claude"},
-        {"id": "claude:sonnet", "label": "Claude Sonnet", "family": "claude"},
-        {"id": "claude:haiku", "label": "Claude Haiku", "family": "claude"},
-        {"id": "codex", "label": f"Codex{' · ' + codex_model if codex_model else ''}", "family": "codex"},
-    ]
 
 
 class Take:
@@ -72,6 +58,7 @@ class Notebook:
         self.T = self.S.trace
         self.id = self.T.id
         self.takes: dict[str, Take] = {}
+        self.checks: dict[str, Take] = {}  # replays of a take's calls, keyed like takes
         self.selected: dict[int, str] = {}
         self.ops: list[dict] = []
         self.lock = threading.RLock()
@@ -149,7 +136,8 @@ class Notebook:
                 op["sample"] = max((o.get("sample", 0) + 1 for o in self.ops if _signature(o, None) == sig), default=0)
             tk = self._apply(op, replay=False)
             self.ops.append(op)
-            self.selected[tk.turn] = tk.id
+            if tk.id in self.takes:  # a new version becomes the one shown; a check just annotates
+                self.selected[tk.turn] = tk.id
             self._save()
         self.emit()
         return tk
@@ -242,7 +230,7 @@ class Notebook:
         tk = Take(op["id"], base.turn, base.parent, "replay", f"⟲ replay of {base.label}", op)
         tk.runtime = None
         tk.nodes = [base.nodes[0]]
-        self.takes[tk.id] = tk
+        self.checks[tk.id] = tk
 
         def work(cb):
             prev = tk.nodes[0]
@@ -309,24 +297,27 @@ class Notebook:
             self._save()
         self.emit()
 
+    def find(self, take_id: str) -> Take:
+        return self.takes[take_id] if take_id in self.takes else self.checks[take_id]
+
     def stop(self, take_id: str):
-        self.takes[take_id].cancel.set()
+        self.find(take_id).cancel.set()
 
     def delete(self, take_id: str):
         with self.lock:
-            tk = self.takes[take_id]
+            tk = self.find(take_id)
             if tk.kind == "original":
                 raise TraceError("the original can't be deleted")
             doomed = {take_id}
             changed = True
-            while changed:  # takes built on top of it go too
+            while changed:  # takes built on top of it go too, and the checks of any of them
                 changed = False
-                for k, t in self.takes.items():
+                for k, t in [*self.takes.items(), *self.checks.items()]:
                     if k not in doomed and (t.parent in doomed or t.op.get("take") in doomed):
                         doomed.add(k)
                         changed = True
             for k in doomed:
-                gone = self.takes.pop(k)
+                gone = self.takes.pop(k, None) or self.checks.pop(k)
                 gone.cancel.set()
                 if gone.run_key and gone.status != "running":  # deleting discards the result: asking again re-runs
                     for f in (CACHE / "runs").glob(f"{gone.run_key}.*"):
@@ -341,18 +332,27 @@ class Notebook:
             self._save()
         self.emit()
 
-    def run_below(self, turn: int, runtime: str, count: int | None = None):
-        """Re-run turn `turn` and the cells below it, one after another, with the original prompts."""
-        turns = [t for t in self.T.turns() if t >= turn][: count or None]
+    def run_below(self, turn: int, runtime: str, count: int | None = None, first: dict | None = None) -> Take:
+        """Make a new version of turn `turn`, then re-run every turn below it with the original prompts, one
+        after another, all with `runtime`. The new version of `turn` is the op `first` (e.g. continuing from one
+        of its cells: switching models mid-turn), or by default the turn re-run from its message."""
+        first = first or {"op": "run", "turn": turn, "runtime": runtime, "prompt": self.T[str(turn)].text}
+        tk = self.submit(first)  # here, so a refusal reaches the caller
+        if tk.turn != turn:
+            raise TraceError(f"that op makes a version of turn {tk.turn}, not {turn}")
+        later = [t for t in self.T.turns() if t > turn][: (count - 1) if count else None]
 
         def go():
-            for t in turns:
-                tk = self.submit({"op": "run", "turn": t, "runtime": runtime, "prompt": self.T[str(t)].text})
-                while tk.status == "running":
+            cur = tk
+            for t in [None, *later]:
+                if t is not None:
+                    cur = self.submit({"op": "run", "turn": t, "runtime": runtime, "prompt": self.T[str(t)].text})
+                while cur.status == "running":
                     time.sleep(0.5)
-                if tk.status != "done" or tk.error:
+                if cur.status != "done" or cur.error:
                     break
         threading.Thread(target=go, daemon=True).start()
+        return tk
 
     # ------------------------------------------------------------ views
     def prompt_for(self, take_id: str) -> str:
@@ -374,7 +374,7 @@ class Notebook:
         return "\n".join(f"• {n}" for n in start.world().fidelity()) or "(no notes)"
 
     def full_output(self, take_id: str, i: int) -> str:
-        nodes = self.takes[take_id].nodes
+        nodes = self.find(take_id).nodes
         if not 0 < i < len(nodes) or not _ready(nodes[i]):
             raise TraceError("that step isn't finished yet")
         return nodes[i].step.output or ""
@@ -391,8 +391,9 @@ class Notebook:
             "started": T.started, "branch": T.git_branch, "source": T.source, "scratch": T.scratch,
             "turns": [{"turn": t, "prompt": T[str(t)].text, "who": T[str(t)].who} for t in T.turns()],
             "takes": {k: self.take_json(tk) for k, tk in self.takes.items()},
+            "checks": {k: self.take_json(tk) for k, tk in self.checks.items()},
             "selected": self.selected, "timeline": self.timeline(), "spent": spent,
-            "runtimes": runtimes_catalog(),
+            "runtimes": catalog(),
         }
 
     def take_json(self, tk: Take) -> dict:
@@ -474,10 +475,7 @@ def _node_json(n: Node, i: int) -> dict:
 
 
 def _rt_label(spec: str) -> str:
-    for r in runtimes_catalog():
-        if r["id"] == spec:
-            return r["label"].split(" · ")[0]
-    return spec
+    return runtime_label(spec)
 
 
 def _short_label(base: Take, i: int) -> str:

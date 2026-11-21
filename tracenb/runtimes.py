@@ -5,11 +5,12 @@ The prefix is handed to every runtime the same way: rendered as a neutral transc
 "what would Codex have done here?" is only a fair comparison if Claude, run as the
 control, sees exactly the same thing Codex does.
 
-Runtime specs: "claude", "claude:opus", "claude:sonnet", "claude:haiku", "claude:<model-id>",
-               "codex", "codex:<model-id>"
+Runtime specs: harness[:model][@effort], e.g. "claude:opus", "claude:haiku@low", "codex:gpt-6-luna@high".
+No model means the harness's configured default; no effort means the harness's default thinking effort.
 """
 from __future__ import annotations
 
+import functools
 import json
 import os
 import subprocess
@@ -137,12 +138,12 @@ CLAUDE_STATE = tuple(f'(subpath "{HOME}/{d}")' for d in (".claude", ".cache", "L
 class Runtime:
     harness = ""
 
-    def __init__(self, model: str = ""):
-        self.model = model
+    def __init__(self, model: str = "", effort: str = ""):
+        self.model, self.effort = model, effort
 
     @property
     def spec(self) -> str:
-        return f"{self.harness}:{self.model}" if self.model else self.harness
+        return (f"{self.harness}:{self.model}" if self.model else self.harness) + (f"@{self.effort}" if self.effort else "")
 
     def run(self, prompt: str, world: World, budget_usd: float | None = None, on_step: OnStep | None = None,
             cancel=None) -> Run:
@@ -219,6 +220,8 @@ class Claude(Runtime):
                 "--no-session-persistence"]
         if self.model:
             argv += ["--model", self.model]
+        if self.effort:
+            argv += ["--effort", self.effort]
         if budget_usd:
             argv += ["--max-budget-usd", str(budget_usd)]
         log = CACHE / "logs" / f"{int(t0 * 1000)}-claude.jsonl"
@@ -293,6 +296,8 @@ class Codex(Runtime):
                 "-c", "sandbox_workspace_write.exclude_slash_tmp=true", "-C", cwd]
         if self.model:
             argv += ["-m", self.model]
+        if self.effort:
+            argv += ["-c", f"model_reasoning_effort={json.dumps(self.effort)}"]
         argv.append("-")
         log = CACHE / "logs" / f"{int(t0 * 1000)}-codex.jsonl"
         rc, err = self._stream(argv, prompt, cwd, handle, log, cancel, env=world.env())
@@ -306,9 +311,93 @@ class Codex(Runtime):
 
 
 def get_runtime(spec: str) -> Runtime:
+    spec, _, effort = spec.partition("@")
     harness, _, model = spec.partition(":")
     if harness == "claude":
-        return Claude(model)
+        return Claude(model, effort)
     if harness == "codex":
-        return Codex(model)
-    raise ValueError(f"unknown runtime {spec!r} (use claude[:model] or codex[:model])")
+        return Codex(model, effort)
+    raise ValueError(f"unknown runtime {spec!r} (use claude[:model][@effort] or codex[:model][@effort])")
+
+
+CLAUDE_EFFORTS = ["low", "medium", "high", "xhigh", "max"]  # `claude --effort`
+
+# Claude kernels are pinned model IDs, never the CLI's aliases: an alias ("sonnet") moves when a new model ships,
+# and a version made with "sonnet" would silently mean a different model than the one that produced it.
+# The CLI has no way to list its models, so this is the current family (the aliases resolved to these, per runs).
+CLAUDE_MODELS = [  # (model id, label, the CLI alias that pointed at it, note)
+    ("claude-fable-5-2", "Claude Fable 5.2", "fable", "Costly: about $0.28 just to answer \"ok\""),
+    ("claude-opus-5-5", "Claude Opus 5.5", "opus", ""),
+    ("claude-sonnet-5-5", "Claude Sonnet 5.5", "sonnet", ""),
+    ("claude-haiku-5-5", "Claude Haiku 5.5", "haiku", ""),
+]
+
+
+@functools.lru_cache(maxsize=None)
+def _version(cmd: str) -> str:
+    try:
+        return subprocess.run([cmd, "--version"], capture_output=True, text=True, timeout=10).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def _toml_value(path: Path, key: str) -> str:
+    try:
+        for line in open(path):
+            if line.strip().startswith(key) and line.split("=", 1)[0].strip() == key:
+                return line.split("=", 1)[1].strip().strip('"')
+    except OSError:
+        pass
+    return ""
+
+
+def catalog() -> list[dict]:
+    """The models a kernel can be, each with its exact model id, the thinking efforts it supports, and the defaults
+    that apply when you don't pick (your own Claude Code / Codex settings). Claude's current family first; then every
+    model the Codex CLI lists, its newest of each family (Astra, Sol, Terra, Luna) first and the rest as older."""
+    try:
+        cs = json.loads((Path.home() / ".claude" / "settings.json").read_text())
+    except (OSError, ValueError):
+        cs = {}
+    claude_model = cs.get("model", "")
+    claude_harness = f"Claude Code {_version('claude').split(' ')[0]}".strip()
+    out = []
+    for mid, lbl, alias, note in CLAUDE_MODELS:
+        per = (cs.get("modelSettings") or {}).get(mid, {}).get("effortLevel")
+        eff, src = (per, "your Claude Code settings for this model") if per else \
+            (cs["effortLevel"], "your Claude Code settings") if cs.get("effortLevel") else ("", "")
+        out.append({"id": f"claude:{mid}", "label": lbl, "model_id": mid, "family": "claude", "group": "Claude",
+                    "efforts": CLAUDE_EFFORTS, "default_effort": eff, "default_source": src, "aliases": [alias],
+                    "is_default": claude_model in (alias, mid), "harness": claude_harness, "description": note})
+    cfg = Path.home() / ".codex" / "config.toml"
+    codex_model, codex_effort = _toml_value(cfg, "model"), _toml_value(cfg, "model_reasoning_effort")
+    codex_harness = _version("codex").replace("codex-cli", "Codex CLI").strip()
+    try:
+        models = json.loads((Path.home() / ".codex" / "models_cache.json").read_text())["models"]
+    except (OSError, ValueError, KeyError):
+        models = []
+    seen = set()
+    for m in sorted((m for m in models if m.get("visibility") == "list"), key=lambda m: m.get("priority", 99)):
+        family = m["slug"].rsplit("-", 1)[-1]
+        eff, src = (codex_effort, "your Codex config") if codex_effort else (m.get("default_reasoning_level", ""), "the model's own default")
+        out.append({"id": f"codex:{m['slug']}", "label": m.get("display_name") or m["slug"], "model_id": m["slug"],
+                    "family": "codex", "group": "Codex" if family not in seen else "Codex — older",
+                    "efforts": [e["effort"] for e in m.get("supported_reasoning_levels", [])],
+                    "default_effort": eff, "default_source": src, "aliases": [], "is_default": m["slug"] == codex_model,
+                    "harness": codex_harness, "description": m.get("description", "")})
+        seen.add(family)
+    if not models:  # no catalogue: Codex with whatever model its config names
+        out.append({"id": "codex", "label": "Codex", "model_id": codex_model, "family": "codex", "group": "Codex",
+                    "efforts": [], "default_effort": codex_effort, "default_source": "your Codex config", "aliases": [],
+                    "is_default": True, "harness": codex_harness, "description": "the model in ~/.codex/config.toml"})
+    return out
+
+
+def label(spec: str) -> str:
+    """'Claude Haiku 5.5 · low', 'GPT-6-Luna · high', 'Codex' … (old alias specs like 'claude:opus' read as the model
+    the alias pointed at)."""
+    base, _, effort = spec.partition("@")
+    harness, _, model = base.partition(":")
+    m = next((m for m in catalog() if m["id"] == base or (m["family"] == harness and model in m["aliases"])), None)
+    name = m["label"] if m else {"claude": "Claude", "codex": "Codex"}.get(harness, harness) + (f" {model}" if model else "")
+    return name + (f" · {effort}" if effort else "")

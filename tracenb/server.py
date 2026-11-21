@@ -144,7 +144,8 @@ class Handler(BaseHTTPRequestHandler):
             elif action == "delete":
                 nb.delete(b["take"])
             elif action == "run_below":
-                nb.run_below(int(b["turn"]), b["runtime"], b.get("count"))
+                tk = nb.run_below(int(b["turn"]), b["runtime"], b.get("count"), b.get("first"))
+                return self._send(200, {"take": tk.id})
             else:
                 return self._send(404, {"error": f"unknown action {action}"})
             self._send(200, {"ok": True})

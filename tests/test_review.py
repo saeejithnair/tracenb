@@ -10,9 +10,9 @@ from conftest import claude_trace
 
 def wait(nb, tid, t=20):
     end = time.time() + t
-    while nb.takes[tid].status == "running" and time.time() < end:
+    while nb.find(tid).status == "running" and time.time() < end:
         time.sleep(0.05)
-    return nb.takes[tid]
+    return nb.find(tid)
 
 def test_rebuild_never_writes_outside_the_world(tmp_path, repo):
     outside = tmp_path / "outside" / "victim.txt"   # under /private/var/folders -> never mounted
@@ -95,3 +95,47 @@ def test_delete_discards_the_result(tmp_path, repo, fake_runtime):
     calls = fake_runtime.calls
     b = wait(nb, nb.submit({"op": "run", "turn": 1, "runtime": "fake", "prompt": "go"}).id)
     assert fake_runtime.calls == calls + 1 and b.status == "done"
+
+def test_a_check_never_changes_the_timeline(tmp_path, repo):
+    tf = claude_trace(tmp_path / "s.jsonl", repo, [("a", [("tool", "Bash", {"command": "ls"}, "notes.txt"), ("say", "x")]),
+                                                   ("b", [("say", "y")])])
+    nb = Notebook(str(tf))
+    before = nb.timeline()
+    r = wait(nb, nb.submit({"op": "replay", "take": "o1"}).id)
+    assert r.id in nb.checks and r.id not in nb.takes
+    assert nb.timeline() == before  # turn 2 is not stale because turn 1 was checked
+    nb.delete(r.id)
+    assert r.id not in nb.checks
+
+def test_commands_never_see_tracenbs_own_python(tmp_path, repo, monkeypatch):
+    import sys
+    own = os.path.join(sys.prefix, "bin")
+    monkeypatch.setenv("PATH", own + os.pathsep + "/usr/bin:/bin")
+    monkeypatch.setenv("VIRTUAL_ENV", sys.prefix)
+    tf = claude_trace(tmp_path / "s.jsonl", repo, [("go", [("say", "x")])])
+    env = base_world(load(str(tf))).env()
+    assert sys.prefix == sys.base_prefix or own not in env["PATH"].split(os.pathsep)
+    assert sys.prefix == sys.base_prefix or "VIRTUAL_ENV" not in env
+
+def test_switching_models_from_a_cell_carries_on_below(tmp_path, repo, fake_runtime):
+    tf = claude_trace(tmp_path / "s.jsonl", repo, [("a", [("tool", "Bash", {"command": "ls"}, "notes.txt"), ("say", "x")]),
+                                                   ("b", [("say", "y")]), ("c", [("say", "z")])])
+    nb = Notebook(str(tf))
+    first = nb.run_below(1, "fake", first={"op": "fork", "take": "o1", "index": 2, "runtime": "fake"})
+    assert first.kind == "fork"
+    end = time.time() + 20
+    while time.time() < end and not all(nb.timeline()[t] and nb.find(nb.timeline()[t]).status == "done"
+                                         and nb.find(nb.timeline()[t]).runtime == "fake" for t in (1, 2, 3)):
+        time.sleep(0.05)
+    tl = nb.timeline()
+    assert tl[1] == first.id                       # turn 1: the recorded ls, then the new model
+    assert nb.find(first.id).nodes[1].state == "recorded"
+    assert [nb.find(tl[t]).runtime for t in (2, 3)] == ["fake", "fake"]  # and every turn below, on top of it
+    assert nb.find(tl[2]).parent == first.id and nb.find(tl[3]).parent == tl[2]
+
+def test_runtime_specs_carry_model_and_effort():
+    from tracenb.runtimes import get_runtime
+    r = get_runtime("codex:gpt-6-luna@low")
+    assert (r.harness, r.model, r.effort, r.spec) == ("codex", "gpt-6-luna", "low", "codex:gpt-6-luna@low")
+    assert get_runtime("claude:sonnet").spec == "claude:sonnet"  # no effort: the spec (and cache keys) unchanged
+    assert get_runtime("codex").spec == "codex"

@@ -16,6 +16,7 @@ import ctypes
 import json
 import hashlib
 import os
+import sys
 import re
 import shutil
 import subprocess
@@ -64,6 +65,18 @@ def publish(tmp: Path, final: Path) -> Path:
 
 def scratch_name(key: str) -> str:
     return f"{key}.building-{os.getpid()}-{uuid.uuid4().hex[:6]}"
+
+
+def user_env() -> dict:
+    """os.environ without tracenb's own interpreter environment."""
+    env = dict(os.environ)
+    if sys.prefix != sys.base_prefix:  # tracenb runs inside a virtualenv (uv run, uv tool, pip -e …)
+        own = os.path.join(sys.prefix, "bin")
+        env["PATH"] = os.pathsep.join(p for p in env.get("PATH", "").split(os.pathsep) if os.path.realpath(p) != os.path.realpath(own))
+        if os.path.realpath(env.get("VIRTUAL_ENV", "/nonexistent")) == os.path.realpath(sys.prefix):
+            env.pop("VIRTUAL_ENV")
+            env.pop("VIRTUAL_ENV_PROMPT", None)
+    return env
 
 
 class World:
@@ -204,9 +217,12 @@ class World:
         return t
 
     def env(self) -> dict:
+        """The user's environment, as the session had it: never tracenb's own (its virtualenv, if it
+        runs in one, isn't something the agent's commands could see)."""
         t = str(self.tmp)
-        # CLAUDE_CODE_TMPDIR: the claude CLI keeps its per-project temp dir there instead of /tmp
-        return {**os.environ, "TMPDIR": t + "/", "TMPPREFIX": t + "/zsh", "CLAUDE_CODE_TMPDIR": t}
+        return {**user_env(), "TMPDIR": t + "/", "TMPPREFIX": t + "/zsh",
+                # the claude CLI keeps its per-project temp dir there instead of /tmp
+                "CLAUDE_CODE_TMPDIR": t}
 
     def sandbox_profile(self, harness_state: tuple[str, ...] = (), offline: bool = False) -> str:
         """The one write rule: only this world (and /dev) is writable. A runtime's harness may also

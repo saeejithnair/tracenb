@@ -1,17 +1,17 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="light">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>tracenb</title>
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='4' cy='4' r='2.5' fill='%237c5cff'/><circle cx='4' cy='12' r='2.5' fill='%23888'/><circle cx='12' cy='12' r='2.5' fill='%2314b8a6'/><path d='M4 6v4M5.5 5.5 11 10.5' stroke='%23888' stroke-width='1.3' fill='none'/></svg>">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect x='1' y='1' width='14' height='14' rx='3' fill='%23f37726'/><path d='M5 4.5v7l6-3.5z' fill='white'/></svg>">
 <link rel="stylesheet" href="/static/app.css">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/4.3.0/marked.min.js"></script>
 </head>
 <body>
 <div id="app"></div>
 <div id="toast"></div>
-<div id="modal" hidden><div class="modal-card"><div class="modal-hd"><b id="modal-title"></b><button class="btn ghost" id="modal-close">Close</button></div><pre id="modal-body"></pre></div></div>
+<div id="modal" hidden><div class="modal-card"><div class="modal-hd"><b id="modal-title"></b><button class="jp-btn" id="modal-close">Close</button></div><div id="modal-body" class="modal-body"></div></div></div>
 <script src="/static/app.js"></script>
 </body>
 </html>

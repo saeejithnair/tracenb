@@ -8,21 +8,29 @@ tracenb open latest     # the most recent one
 tracenb open 71361987   # by session id prefix, or a path to the .jsonl
 ```
 
-Each **turn is a cell**: your message is the input, what the agent did is the output. From there:
+It looks like a Jupyter notebook the agent wrote while it worked: every **tool call is a code cell** with its
+output, every bit of the agent's prose is a **markdown cell**, and each of your messages starts a **turn**. The
+**kernel** (top right) is the model that writes the agent's side. There are two verbs:
 
-| you want to know… | in the notebook |
+- **Edit** any cell: your message, a command (click it), a command's output (double-click it), the agent's words.
+- **Run** from any cell (Shift+Enter or ▶): that cell stands as written, and the kernel writes the rest of the turn.
+  An edited command really executes first, sandboxed, in a copy of the project as it was at that moment; an edited
+  output is just what the agent sees. Running an unedited cell hands the rest of the turn to the kernel.
+
+Every run becomes a new **version** of its turn (‹ 2/5 › next to your message; the recording is version 1). Turns
+below a change are marked out of date (their old content stays visible) until you run them again.
+
+| you want to know… | do |
 |---|---|
-| what would another model have done here? | pick a runtime in the cell (Claude Opus / Sonnet / Haiku / Codex) and ▶ Run — or **▶ every model** |
-| what if I had asked differently? | click the message, rewrite it, run |
-| what if the agent had run a different command? | open the tool call → **✎ Edit call** — it really runs, in a sandboxed copy of the project as it was at that moment — then continue with any model |
-| what if that command had returned something else? | **⚑ Fake result**, then continue |
-| what would model X do from *this* point? | **⑂ Take over from here** |
-| how faithful is this reconstruction? | **⟲ replay calls**: re-executes the turn's recorded calls and marks which results came out identical |
-| how do the alternatives differ? | **⇆ Compare**: side by side, with the calls the original didn't make highlighted |
+| what would another model have done here? | pick a kernel, select your message, Shift+Enter — or Run ▸ Run this turn with several kernels…, then **compare** |
+| what if I had asked differently? | click your message, rewrite it, Shift+Enter |
+| what if the agent had run a different command? | click the command, change it, Shift+Enter |
+| what if that command had returned something else? | double-click the output, change it, Shift+Enter |
+| what would model X do from *this* point? | pick kernel X, select the cell, Shift+Enter (the rest of the turn) — or ⏩ to keep going with X through every turn below |
+| how faithful is the reconstruction? | Run ▸ Replay the recorded calls: each output gets ✓ (same) or ≠ (different) in its prompt column |
 
-Every run becomes a **take** on its cell (tabs, each with a barcode of its steps). The selected takes form the
-**timeline** (right rail); cells whose context changed upstream go **stale** until re-run (▶▶ runs a cell and
-everything below it with the original messages). Keyboard: `j`/`k`, `e`, `⇧⏎`, `[`/`]`, `c`, `o`, `?`.
+Keyboard (as in Jupyter): `↑`/`↓` or `j`/`k`, `Enter` edit, `Esc` leave edit mode, `Shift+Enter` run, `[`/`]` versions,
+`C` compare, `I,I` interrupt.
 
 ## How it works
 
@@ -32,6 +40,7 @@ step, a faked observation, a step produced by a runtime). A cell you leave alone
 and you're on a new timeline. Everything expensive is memoized by a content key (the path's actions + runtime +
 sample), so reopening a notebook replays every result from cache and never computes anything (unfinished work
 comes back as "interrupted"); asking for the same thing twice draws a new sample; deleting a take discards its result.
+A replay is a *check*, not a version: it annotates the take it re-executed and never changes the timeline.
 Identical requests in flight at once are computed once.
 
 **Worlds.** Executing a tool call needs the files as they were *at that point*. The base world is the project's

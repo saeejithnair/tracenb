@@ -99,9 +99,9 @@ def test_offline_rebuild_has_no_network(trace_file):
     S = tn.load(str(trace_file))
     w = S.root.world().fork("net-test")
     from tracenb.tools import run_shell
-    probe = "python3 -c \"import socket; s=socket.socket(); s.settimeout(3); s.connect(('1.1.1.1', 53)); print('connected')\""
+    probe = "python3 -c \"import socket; s=socket.socket(); s.settimeout(3); s.connect(('1.1.1.1', 53)); print('CONN' + 'ECTED')\""
     out, err = run_shell(probe, w, offline=True)
-    assert err and "connected" not in out
+    assert err and "CONNECTED" not in out  # the marker can't come from a traceback echoing the source
 
 
 # ---------------------------------------------------------------- observations, patches
@@ -125,9 +125,9 @@ def test_apply_patch(trace_file, repo):
 # ---------------------------------------------------------------- kernel
 def wait(nb, take_id, t=20):
     end = time.time() + t
-    while nb.takes[take_id].status == "running" and time.time() < end:
+    while nb.find(take_id).status == "running" and time.time() < end:
         time.sleep(0.05)
-    return nb.takes[take_id]
+    return nb.find(take_id)
 
 
 def test_timeline_staleness_and_persistence(trace_file, fake_runtime):
